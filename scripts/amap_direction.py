@@ -7,11 +7,12 @@ import json
 import math
 import os
 import ssl
+import time
 import urllib.parse
 import urllib.request
 from typing import Dict, Optional, Tuple
 
-# Try to load from .env.local if AMAP_KEY not in environment
+# Try to load from .env.local without overriding the process environment.
 def _load_env_file():
     """Simple .env.local loader without external dependencies"""
     try:
@@ -21,7 +22,7 @@ def _load_env_file():
                 line = line.strip()
                 if line.startswith('AMAP_KEY='):
                     key = line.split('=', 1)[1].strip().strip('"\'')
-                    os.environ['AMAP_KEY'] = key
+                    os.environ.setdefault('AMAP_KEY', key)
                     break
     except Exception:
         pass  # Silently ignore if file not found or unreadable
@@ -29,14 +30,28 @@ def _load_env_file():
 _load_env_file()
 
 AMAP_KEY = os.getenv("AMAP_KEY", "")
-if not AMAP_KEY:
-    raise ValueError("AMAP_KEY not set. Please configure it in .env.local or set environment variable")
 
-# Module availability flag
+# Module availability flag. A missing key disables Amap requests but must not
+# prevent importing the planner or using providers that do not need Amap.
 AMAP_AVAILABLE = True
 AMAP_GEOCODE_URL = "https://restapi.amap.com/v3/geocode/geo"
 AMAP_DIRECTION_URL = "https://restapi.amap.com/v3/direction/transit/integrated"
 AMAP_WALKING_URL = "https://restapi.amap.com/v3/direction/walking"
+_REQUEST_DEADLINE = None
+
+
+def set_request_deadline(deadline):
+    global _REQUEST_DEADLINE
+    _REQUEST_DEADLINE = deadline
+
+
+def _bounded_timeout(timeout):
+    if _REQUEST_DEADLINE is None:
+        return timeout
+    remaining = _REQUEST_DEADLINE - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("request deadline exhausted")
+    return min(timeout, remaining)
 
 
 def _to_int(value, default: int = 0) -> int:
@@ -168,7 +183,7 @@ def _http_get_json(url: str, params: Dict, timeout: int = 15) -> Optional[Dict]:
         req = urllib.request.Request(full_url, method="GET")
         req.add_header("Accept", "application/json")
         ctx = ssl.create_default_context()
-        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+        with urllib.request.urlopen(req, timeout=_bounded_timeout(timeout), context=ctx) as resp:
             return json.loads(resp.read().decode("utf-8", errors="replace"))
     except Exception as e:
         return {"error": str(e)}
@@ -179,6 +194,9 @@ def geocode_amap(address: str, city: str = "") -> Optional[Tuple[float, float]]:
     Geocode address using Amap API
     Returns: (longitude, latitude) tuple
     """
+    if not AMAP_KEY:
+        return None
+
     params = {
         "key": AMAP_KEY,
         "address": address,
@@ -208,6 +226,9 @@ def get_transit_details(origin_lng: float, origin_lat: float,
     Get detailed transit route with step-by-step instructions
     Returns full route details including bus lines, stops, walking segments
     """
+    if not AMAP_KEY:
+        return None
+
     origin = f"{origin_lng},{origin_lat}"
     destination = f"{dest_lng},{dest_lat}"
     
@@ -333,6 +354,9 @@ def get_transit_time(origin_lng: float, origin_lat: float,
         city: Origin city code/name (e.g., "天津", "022")
         cityd: Destination city code/name (default: same as city)
     """
+    if not AMAP_KEY:
+        return None
+
     origin = f"{origin_lng},{origin_lat}"
     destination = f"{dest_lng},{dest_lat}"
     
@@ -389,6 +413,9 @@ def get_walking_time(origin_lng: float, origin_lat: float,
     """
     Get pure walking time using Amap (fallback when transit unavailable)
     """
+    if not AMAP_KEY:
+        return None
+
     origin = f"{origin_lng},{origin_lat}"
     destination = f"{dest_lng},{dest_lat}"
     

@@ -45,7 +45,7 @@ This skill is a **single top-level skill**. Internally it may call the existing 
 5. Run `unified-search` over those queries and top POI candidates
 6. Score evidence via auto-derived category hints (from CATEGORY_ALIASES)
 7. **Quality gate**: assess bundle quality (poor/weak/acceptable); if evidence is weak, trigger specialty fallback
-8. **Specialty fallback**: for cinema queries, supplement with Maoyan API city-level hall search (IMAX/4DX/CINITY/Dolby/LUXE/CGS)
+8. **Specialty fallback**: for cinema queries with a recognized city in the origin, supplement with Maoyan city-level hall search (IMAX/4DX/CINITY/Dolby/LUXE/CGS); do not substitute an unrelated default city.
 9. Return:
    - top pick
    - backups
@@ -63,8 +63,16 @@ This skill is a **single top-level skill**. Internally it may call the existing 
 
 - `--origin` explicitly set: used directly
 - `--corelocation` flag: forces CoreLocationCLI (WiFi-based, ~500m accuracy) to get current coordinates
-- No flag + query contains nearby hints (`附近`/`周边`/`方圆`): auto-tries CoreLocationCLI → IP geolocation fallback
+- `--location-policy auto` (default) + query contains nearby hints (`附近`/`周边`/`方圆`): tries CoreLocationCLI → IP geolocation fallback
+- `--location-policy corelocation` or `ip`: use only that automatic location source
+- `--location-policy disabled`: do not resolve location; nearby requests require `--origin`
+- `--timeout` sets the overall request budget (default 1800 seconds); map, geocoding, location, routing, and unified-search calls are capped by the remaining time.
 - None of the above: "未指定起点"
+
+Automatic IP location queries public IP lookup services and Amap. POI lookups send the
+resolved coordinates or place name to the selected map provider; web enrichment sends
+search text to configured search providers. Use `--location-policy disabled` with an
+explicit `--origin` when you do not want automatic device/IP location lookup.
 
 ## Quick Start
 
@@ -100,6 +108,14 @@ The planner returns either:
 - **store-level recommendation** when evidence is sufficient, or
 - **area-level fallback** when exact shop hits are weak.
 
+In JSON mode, the top-level payload contains `status`, `request`, `poi_provider`, `queries`, and `result`:
+- `status.overall`: `success`, `empty`, `partial`, or `error`; `status.components.poi` and `status.components.web_search` summarize each stage.
+- `request`: normalized query, origin, category, radius, preferences, constraints, and avoid rules. A source IP from IP geolocation is omitted.
+- `poi_provider`: structured POI provider, resolved origin, candidates, errors, and `fallback_from` when Amap falls back to Overpass.
+- `queries`: web queries attempted. `result` keeps the existing mode-specific recommendation/search fields and per-candidate evidence, accessibility, and constraint assessments.
+
+Treat provider and candidate fields as additive: consumers should ignore unknown fields and use the explicit component status to distinguish an empty result from a failed or partial lookup.
+
 Confidence levels:
 - `high`: repeated store-level hits with supporting evidence
 - `medium`: usable candidates but some ambiguity
@@ -109,7 +125,7 @@ Confidence levels:
 
 This skill uses the unified-search entrypoint here:
 ```bash
-bash <unified-search>/scripts/unified-search.sh "<query>" --num 5 --topic general
+bash <unified-search>/scripts/unified-search.sh "<query>"
 ```
 
 **Important — which path actually runs (verified 2026-05-31):**
@@ -117,8 +133,8 @@ bash <unified-search>/scripts/unified-search.sh "<query>" --num 5 --topic genera
 - For an ordinary query with no `--legacy`/`--mode` flag, the script routes to
   `run_search_layer_auto` → deep **search-layer** with `--source exa,tavily,grok,tinyfish`.
   So Grok + TinyFish are part of the real path; the legacy Tavily+Exa+Google merge is **not** used here.
-- `--num 5 --topic general` are legacy-only flags. On the deep search-layer path they are
-  effectively ignored (not forwarded to `search-layer`), so they do not change behavior.
+- Ordinary query calls automatically route to deep search. Do not append legacy
+  `--num`/`--topic` flags; their values can be incorporated into the query text.
 - When debugging latency/hangs, profile `run-search-layer.sh` → `search.py` (deep search-layer),
   **not** `unified-search-legacy.sh`. The legacy script is a different code path.
 
@@ -133,16 +149,16 @@ See `references/lessons-2026-05-31.md` for hard-won debugging notes:
 
 ## Rules
 
-- **Planner execution time**: The planner is silent during execution (3-10 minutes is normal).
-  All output is buffered until completion — there is zero intermediate output even on
-  stdout. **MANDATORY: when running planner.py via exec, you MUST set timeout=1800
-  (30 minutes).** Do NOT use shorter timeouts (120s, 600s) — they will kill the process
-  before unified-search completes. The planner runs these stages sequentially: POI search
-  → web enrichment (up to 5 POIs, 30-90s each) → anchor expansion → unified-search
-  queries (up to 3, 30-90s each) → decision → transit details. 5 POIs × 90s ≈ 7.5 min
-  for web enrichment alone; the full pipeline can exceed 10 minutes. Do NOT kill the
-  process because you see "no output yet." If the planner actually hangs, it's more
-  likely in the unified-search network calls than in local Python code.
+- **Planner output contract**: `--format json` writes one JSON document to stdout; progress
+  and provider diagnostics go to stderr. The JSON payload includes a top-level `status`
+  object with `overall` (`success`, `empty`, `partial`, or `error`) and component states
+  under `components.poi` / `components.web_search`. Failed web runs do not contribute
+  positive evidence scores. The planner `--timeout` is a total request budget (default
+  1800 seconds); each provider and unified-search subprocess receives no more than the
+  remaining time. When invoking via exec, set the outer process timeout slightly above
+  the configured planner budget so it has time to serialize the final result. Shorter
+  runs are available by explicitly setting `--timeout`. In JSON mode, monitor stderr for
+  progress; stdout is reserved for the final document.
 
 - Prefer one final recommendation workflow, not fragmented sub-skills
 - If exact local store evidence is weak, **do not hallucinate shop names**
@@ -179,7 +195,9 @@ See `references/lessons-2026-05-31.md` for hard-won debugging notes:
   Use `--corelocation` flag to force this, or rely on auto-detection when origin is
   unspecified and query contains nearby hints (`附近`/`周边`/`方圆`). CoreLocationCLI may
   trigger a macOS location permission popup on first use.
-  See `scripts/macos_location.py` for the implementation.
+  `--location-policy` supports `auto` (default), `corelocation`, `ip`, and `disabled`.
+  When lookup is disabled and no origin is supplied, the planner returns `origin_required`
+  and skips external web search. See `scripts/macos_location.py` for the implementation.
 
 ## Suggested trigger examples
 

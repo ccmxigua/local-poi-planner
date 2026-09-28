@@ -14,6 +14,7 @@ import json
 import os
 import re
 import ssl
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -41,6 +42,15 @@ IP_SERVICES = [
 ]
 
 
+def _bounded_timeout(deadline, timeout):
+    if deadline is None:
+        return timeout
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("request deadline exhausted")
+    return min(timeout, remaining)
+
+
 def _http_get_text(url, timeout=5):
     req = urllib.request.Request(url)
     req.add_header("User-Agent", UA)
@@ -49,12 +59,14 @@ def _http_get_text(url, timeout=5):
         return resp.read().decode("utf-8", errors="replace").strip()
 
 
-def _fetch_public_ips():
+def _fetch_public_ips(deadline=None):
     """Try every IP lookup service; return list of (source_name, ip_string)."""
     results = []
     for name, url in IP_SERVICES:
+        if deadline is not None and deadline <= time.monotonic():
+            break
         try:
-            text = _http_get_text(url, timeout=5)
+            text = _http_get_text(url, timeout=_bounded_timeout(deadline, 5))
         except Exception:
             continue
 
@@ -73,7 +85,7 @@ def _fetch_public_ips():
     return results
 
 
-def _amap_ip_geolocate(ip, key=None):
+def _amap_ip_geolocate(ip, key=None, deadline=None):
     """Query Amap IP geolocation API. Returns {lat, lon, province, city, ...} or None."""
     if not key:
         key = os.getenv("AMAP_KEY", "")
@@ -87,7 +99,7 @@ def _amap_ip_geolocate(ip, key=None):
         req = urllib.request.Request(url)
         req.add_header("User-Agent", UA)
         ctx = ssl.create_default_context()
-        with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
+        with urllib.request.urlopen(req, timeout=_bounded_timeout(deadline, 10), context=ctx) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="replace"))
     except Exception:
         return None
@@ -124,14 +136,14 @@ def _amap_ip_geolocate(ip, key=None):
     }
 
 
-def get_ip_location():
+def get_ip_location(deadline=None):
     """
     Resolve current approximate location via IP geolocation.
 
     Returns dict with lat, lon, province, city, accuracy, or None if
     all services fail or Amap cannot geolocate the IP.
     """
-    ip_list = _fetch_public_ips()
+    ip_list = _fetch_public_ips(deadline=deadline)
     if not ip_list:
         return None
 
@@ -139,7 +151,9 @@ def get_ip_location():
     ip_list.sort(key=lambda x: 0 if x[0] == "ipip.net" else 1)
 
     for source, ip in ip_list:
-        result = _amap_ip_geolocate(ip)
+        if deadline is not None and deadline <= time.monotonic():
+            break
+        result = _amap_ip_geolocate(ip, deadline=deadline)
         if result:
             result["ip_source"] = source
             return result

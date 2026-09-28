@@ -7,7 +7,7 @@ This skill is ready for commercial/non-commercial use. <br>
 [ccmxigua](https://clawhub.ai/user/ccmxigua) <br>
 
 ### License/Terms of Use: <br>
-MIT-0 <br>
+MIT <br>
 
 
 ## Use Case: <br>

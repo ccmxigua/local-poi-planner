@@ -14,4 +14,4 @@ See [SKILL.md](./SKILL.md) for full documentation.
 
 ## License
 
-MIT-0
+MIT

@@ -27,7 +27,7 @@ if not AMAP_KEY:
 GEOCODE_API_URL = "https://restapi.amap.com/v3/geocode/geo"
 
 
-def geocode_address(address: str) -> dict:
+def geocode_address(address: str, timeout: float = 10) -> dict:
     """
     使用高德地图API解析任意中文地址
     
@@ -62,7 +62,7 @@ def geocode_address(address: str) -> dict:
         url = f"{GEOCODE_API_URL}?{query_string}"
         
         req = urllib.request.Request(url, headers={"Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=10) as response:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
             data = json.loads(response.read().decode("utf-8", errors="replace"))
         
         if data.get("status") != "1":

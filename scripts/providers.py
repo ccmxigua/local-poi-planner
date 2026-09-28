@@ -4,6 +4,7 @@ import math
 import os
 import re
 import ssl
+import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -42,6 +43,27 @@ AMAP_TEXT_SEARCH_URL = "https://restapi.amap.com/v3/place/text"
 AMAP_INPUTTIPS_URL = "https://restapi.amap.com/v3/assistant/inputtips"
 UA = "local-poi-planner/0.2 (+OpenClaw skill)"
 
+_REQUEST_DEADLINE = None
+
+
+def set_request_deadline(deadline):
+    """Set a monotonic request deadline shared by provider calls in this process."""
+    global _REQUEST_DEADLINE
+    _REQUEST_DEADLINE = deadline
+    if AMAP_AVAILABLE:
+        amap_direction.set_request_deadline(deadline)
+    if AMAP_POI_AVAILABLE:
+        amap_poi.set_request_deadline(deadline)
+
+
+def _bounded_timeout(timeout):
+    if _REQUEST_DEADLINE is None:
+        return timeout
+    remaining = _REQUEST_DEADLINE - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("request deadline exhausted")
+    return min(timeout, remaining)
+
 BIG_AOI_RE = re.compile(r"(大学|学院|学校|校区|医院|商场|广场|景区|公园|园区|火车站|机场)")
 TRANSIT_NAME_RE = re.compile(r"(地铁站|公交站|轻轨站|火车站入口|公交枢纽)")
 SCHOOL_RE = re.compile(r"(大学|学院|学校|校区)")
@@ -61,6 +83,8 @@ AMAP_CATEGORY_KEYWORDS = {
     "tea": "奶茶",
     "bakery": "面包",
     "restaurant": "餐厅",
+    "加油站": "加油站",
+    "充电站": "充电桩",
     "网吧": "网吧",
     "KTV": "KTV",
     "电影院": "电影院",
@@ -177,6 +201,7 @@ def _score_override_candidate(query_name: str, override_key: str):
 
 
 def _http_get_json(url, params=None, timeout=20, method="GET", data=None):
+    timeout = _bounded_timeout(timeout)
     if params:
         url = url + "?" + urllib.parse.urlencode(params)
     req = urllib.request.Request(url, method=method)
@@ -205,6 +230,8 @@ def load_geocode_overrides():
 
 def normalize_category(category: str):
     raw = (category or "").strip().lower()
+    if raw == "ktv":
+        return "KTV"
     return CATEGORY_ALIASES.get(raw, raw or "restaurant")
 
 
@@ -380,7 +407,7 @@ def geocode_place(name):
     if is_chinese:
         try:
             from amap_geocode import geocode_address
-            result = geocode_address(name)
+            result = geocode_address(name, timeout=_bounded_timeout(10))
             if result.get("success") and not _is_transit_candidate(name, "", result.get("level", "")):
                 return {
                     "name": name,
@@ -455,10 +482,47 @@ def category_to_patterns(category):
             '["amenity"="fast_food"]',
             '["cuisine"~"restaurant|hotpot|japanese|western|chinese|bbq|noodle", i]',
         ]
-    return ['["amenity"="restaurant"]']
+    if category == "加油站":
+        return ['["amenity"="fuel"]']
+    if category == "充电站":
+        return ['["amenity"="charging_station"]']
+    # An unsupported category must not silently become a restaurant search.
+    return []
+
+
+AVOID_NAME_HINTS = {
+    "night_market": ["夜市", "小吃街", "night market"],
+    "takeaway_only": ["外带", "外賣", "窗口", "档口", "外卖档口", "takeaway"],
+    "no_seating": ["无座位", "無座位", "站着吃", "无堂食", "無堂食"],
+}
+
+
+def _matches_avoid(poi, avoid_values):
+    tags = poi.get("tags") or {}
+    if not isinstance(tags, dict):
+        tags = {}
+    name = str(poi.get("name") or "").casefold()
+    haystack = " ".join([
+        name,
+        str(poi.get("address") or ""),
+        " ".join(str(value) for value in tags.values()),
+    ]).casefold()
+    for value in avoid_values or []:
+        value = str(value)
+        hints = AVOID_NAME_HINTS.get(value.casefold())
+        # Free-form avoid strings retain the old name-only matching behavior;
+        # broad tag/address checks are safe only for known semantic categories.
+        if hints is None:
+            if str(value).casefold() in name:
+                return True
+            continue
+        if any(hint.casefold() in haystack for hint in hints if hint):
+            return True
+    return False
 
 
 def haversine_m(lat1, lon1, lat2, lon2):
+    lat1, lon1, lat2, lon2 = map(float, (lat1, lon1, lat2, lon2))
     r = 6371000
     p1, p2 = math.radians(lat1), math.radians(lat2)
     dp = math.radians(lat2 - lat1)
@@ -467,14 +531,45 @@ def haversine_m(lat1, lon1, lat2, lon2):
     return 2 * r * math.asin(math.sqrt(a))
 
 
+def _parse_coordinates(value):
+    match = re.match(r"^\s*(-?\d+(?:\.\d+)?)\s*[,，]\s*(-?\d+(?:\.\d+)?)\s*$", value or "")
+    if not match:
+        return None
+    lat, lon = float(match.group(1)), float(match.group(2))
+    if not (math.isfinite(lat) and math.isfinite(lon) and -90 <= lat <= 90 and -180 <= lon <= 180):
+        return False
+    return lat, lon
+
+
 
 def search_overpass(req, origin_name, radius_m=2200, limit=8, enable_accessibility=True):
     from planner import rank_poi
-    origin = geocode_place(origin_name)
+    patterns = category_to_patterns(req["category"])
+    if not patterns:
+        return {
+            "provider": "osm_overpass",
+            "origin": None,
+            "results": [],
+            "error": "unsupported_category",
+        }
+
+    coordinates = _parse_coordinates(origin_name)
+    if coordinates is False:
+        return {"provider": "osm_overpass", "origin": None, "results": [], "error": "invalid_coordinates"}
+    if coordinates:
+        lat, lon = coordinates
+        origin = {
+            "name": origin_name,
+            "lat": lat,
+            "lon": lon,
+            "display_name": origin_name,
+            "provider": "coordinates",
+        }
+    else:
+        origin = geocode_place(origin_name)
     if not origin:
         return {"provider": "osm_overpass", "origin": None, "results": [], "error": "origin_geocode_failed"}
 
-    patterns = category_to_patterns(req["category"])
     blocks = []
     for pat in patterns:
         blocks.append(f"node(around:{radius_m},{origin['lat']},{origin['lon']}){pat};")
@@ -495,9 +590,17 @@ def search_overpass(req, origin_name, radius_m=2200, limit=8, enable_accessibili
         name = tags.get("name")
         if not name:
             continue
+        if _matches_avoid({"name": name, "tags": tags}, req.get("avoid", [])):
+            continue
         lat = el.get("lat") or (el.get("center") or {}).get("lat")
         lon = el.get("lon") or (el.get("center") or {}).get("lon")
         if lat is None or lon is None:
+            continue
+        try:
+            lat, lon = float(lat), float(lon)
+        except (TypeError, ValueError):
+            continue
+        if not (math.isfinite(lat) and math.isfinite(lon) and -90 <= lat <= 90 and -180 <= lon <= 180):
             continue
         key = (name, round(lat, 5), round(lon, 5))
         if key in seen:
@@ -537,20 +640,7 @@ def _format_amap_pois(pois, req, ref_lat, ref_lon, anchors, limit, enable_access
     for poi in pois:
         poi_name = poi.get("name", "")
 
-        should_avoid = False
-        for pattern in req.get("avoid", []):
-            if pattern.lower() in poi_name.lower():
-                should_avoid = True
-                break
-        if should_avoid:
-            continue
-
-        meets_constraints = True
-        for constraint in req.get("constraints", []):
-            if constraint == "seating" and not any(word in poi_name for word in ["厅", "堂", "店", "铺", "屋", "馆"]):
-                meets_constraints = False
-                break
-        if not meets_constraints:
+        if _matches_avoid(poi, req.get("avoid", [])):
             continue
 
         distance_m = poi.get("distance_m")
@@ -560,13 +650,20 @@ def _format_amap_pois(pois, req, ref_lat, ref_lon, anchors, limit, enable_access
             distance_m = int(float(distance_m)) if distance_m not in (None, "") else None
         except (TypeError, ValueError):
             distance_m = None
+        try:
+            poi_lat = float(poi.get("lat"))
+            poi_lon = float(poi.get("lon"))
+        except (TypeError, ValueError):
+            continue
+        if not (math.isfinite(poi_lat) and math.isfinite(poi_lon) and -90 <= poi_lat <= 90 and -180 <= poi_lon <= 180):
+            continue
         if distance_m is None:
-            distance_m = int(haversine_m(ref_lat, ref_lon, poi.get("lat"), poi.get("lon")))
+            distance_m = int(haversine_m(ref_lat, ref_lon, poi_lat, poi_lon))
 
         formatted_poi = {
             "name": poi.get("name"),
-            "lat": poi.get("lat"),
-            "lon": poi.get("lon"),
+            "lat": poi_lat,
+            "lon": poi_lon,
             "address": poi.get("address"),
             "tel": poi.get("tel"),
             "distance_m": distance_m,
@@ -605,7 +702,7 @@ def search_amap_poi(req, origin_name, radius_m=3000, limit=8, enable_accessibili
         return {"provider": "amap_poi", "origin": None, "results": [], "error": "origin_geocode_failed"}
 
     if not AMAP_POI_AVAILABLE:
-        return search_overpass(req, origin_name, radius_m, limit, enable_accessibility)
+        return {"provider": "amap_poi", "origin": origin, "results": [], "error": "amap_poi_unavailable"}
 
     category = normalize_category(req.get("category", "restaurant"))
     keywords = AMAP_CATEGORY_KEYWORDS.get(category, category or "餐厅")
@@ -619,9 +716,9 @@ def search_amap_poi(req, origin_name, radius_m=3000, limit=8, enable_accessibili
             limit=limit * 2,
         )
         if not raw_results:
-            return search_overpass(req, origin_name, radius_m, limit, enable_accessibility)
-    except Exception:
-        return search_overpass(req, origin_name, radius_m, limit, enable_accessibility)
+            return {"provider": "amap_poi", "origin": origin, "results": [], "error": "empty"}
+    except Exception as exc:
+        return {"provider": "amap_poi", "origin": origin, "results": [], "error": str(exc)}
 
     anchors = load_anchors().get(origin_name, [])
     results = _format_amap_pois(raw_results, req, origin["lat"], origin["lon"], anchors, limit, enable_accessibility)
@@ -664,6 +761,7 @@ def search_amap_poi_by_coords(req, lat, lon, radius_m=3000, limit=8, enable_acce
 
 def _maoyan_http_get(url, params=None, timeout=15):
     """HTTP GET with Maoyan mobile headers."""
+    timeout = _bounded_timeout(timeout)
     if params:
         url = url + "?" + urllib.parse.urlencode(params)
     req = urllib.request.Request(url)
@@ -719,6 +817,19 @@ def search_maoyan_cinema_halls(city_name, special_hall_types=None, max_cinemas=1
     for cinema in all_cinemas[:max_cinemas]:
         tag = cinema.get("tag", {})
         hall_types_raw = tag.get("hallType", []) if isinstance(tag, dict) else []
+        if not hall_types_raw and isinstance(tag, dict):
+            hall_type_objects = tag.get("hallTypeVOList") or []
+            hall_types_raw = [
+                item.get("name", "") if isinstance(item, dict) else str(item)
+                for item in hall_type_objects
+            ]
+        if not isinstance(hall_types_raw, list):
+            hall_types_raw = [hall_types_raw]
+        hall_types_raw = [
+            item.get("name", "") if isinstance(item, dict) else str(item)
+            for item in hall_types_raw
+        ]
+        hall_types_raw = [item for item in hall_types_raw if item]
         if not hall_types_raw:
             continue
 
@@ -758,9 +869,16 @@ def _map_hall_types(hall_types_raw, target_types):
 
 
 def search_pois(req, origin_name, radius_m=3000, limit=8, enable_accessibility=True, ip_location=None):
+    if (not origin_name or origin_name == "未指定起点") and not ip_location:
+        return {
+            "provider": "none",
+            "origin": None,
+            "results": [],
+            "error": "origin_required",
+        }
     # When origin is unresolved but IP coordinates are available, use them directly
     if ip_location and (not origin_name or origin_name == "未指定起点"):
-        return search_amap_poi_by_coords(
+        result = search_amap_poi_by_coords(
             req,
             lat=ip_location["lat"],
             lon=ip_location["lon"],
@@ -768,15 +886,30 @@ def search_pois(req, origin_name, radius_m=3000, limit=8, enable_accessibility=T
             limit=limit,
             enable_accessibility=enable_accessibility,
         )
+        if result.get("results"):
+            return result
+        fallback = search_overpass(
+            req,
+            f"{ip_location['lat']},{ip_location['lon']}",
+            radius_m,
+            limit,
+            enable_accessibility,
+        )
+        fallback["fallback_from"] = {"provider": "amap_poi", "reason": result.get("error") or "empty"}
+        return fallback
 
     # Detect bare GPS coordinates (e.g., "39.060938,117.281150")
-    gps_match = re.match(r"^\s*(-?\d+\.?\d*)\s*[,，]\s*(-?\d+\.?\d*)\s*$", origin_name)
-    if gps_match and AMAP_POI_AVAILABLE:
-        lat, lon = float(gps_match.group(1)), float(gps_match.group(2))
+    coordinates = _parse_coordinates(origin_name)
+    if coordinates is False:
+        return {"provider": "coordinates", "origin": None, "results": [], "error": "invalid_coordinates"}
+    if coordinates:
+        lat, lon = coordinates
         result = search_amap_poi_by_coords(req, lat, lon, radius_m, limit, enable_accessibility)
-        if result.get("results") and len(result["results"]) > 0:
+        if result.get("results"):
             return result
-        return search_overpass(req, origin_name, radius_m, limit, enable_accessibility)
+        fallback = search_overpass(req, origin_name, radius_m, limit, enable_accessibility)
+        fallback["fallback_from"] = {"provider": "amap_poi", "reason": result.get("error") or "empty"}
+        return fallback
 
     is_chinese_location = bool(re.search(r"[\u4e00-\u9fff]", origin_name))
 
@@ -784,5 +917,7 @@ def search_pois(req, origin_name, radius_m=3000, limit=8, enable_accessibility=T
         result = search_amap_poi(req, origin_name, radius_m, limit, enable_accessibility)
         if result.get("results") and len(result["results"]) > 0:
             return result
-        return search_overpass(req, origin_name, radius_m, limit, enable_accessibility)
+        fallback = search_overpass(req, origin_name, radius_m, limit, enable_accessibility)
+        fallback["fallback_from"] = {"provider": "amap_poi", "reason": result.get("error") or "empty"}
+        return fallback
     return search_overpass(req, origin_name, radius_m, limit, enable_accessibility)

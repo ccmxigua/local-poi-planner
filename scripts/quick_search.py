@@ -7,9 +7,13 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 
 from providers import search_pois
-from planner import (
-    parse_request, _llm_extract_amap_terms, normalize_category,
-)
+from planner import parse_request, normalize_category
+try:
+    from planner import _llm_extract_amap_terms
+except ImportError:
+    # This helper is optional; the standard request parser already provides a
+    # keyword fallback and must remain usable without the experimental LLM path.
+    _llm_extract_amap_terms = None
 
 query = "我附近的修理书包"
 args = SimpleNamespace(query=query, origin=None, category=None, 
@@ -19,7 +23,7 @@ print("🔍 解析请求...")
 req = parse_request(args)
 
 print("🧠 LLM 提取类别...")
-llm_raw = _llm_extract_amap_terms(query)
+llm_raw = _llm_extract_amap_terms(query) if _llm_extract_amap_terms else None
 # Grok is verbose - extract first line of comma-separated terms
 llm_terms = None
 if llm_raw:

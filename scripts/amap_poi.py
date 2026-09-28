@@ -5,6 +5,8 @@ Amap POI Provider - 高德地图POI搜索
 """
 import json
 import ssl
+import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -191,6 +193,21 @@ TYPECODE_MAP = {
 DEFAULT_TYPECODES = "050000"  # 默认: 餐饮大类
 
 API_URL = "https://restapi.amap.com/v3/place/around"
+_REQUEST_DEADLINE = None
+
+
+def set_request_deadline(deadline):
+    global _REQUEST_DEADLINE
+    _REQUEST_DEADLINE = deadline
+
+
+def _bounded_timeout(timeout):
+    if _REQUEST_DEADLINE is None:
+        return timeout
+    remaining = _REQUEST_DEADLINE - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("request deadline exhausted")
+    return min(timeout, remaining)
 
 
 def _load_key():
@@ -299,12 +316,12 @@ def _search_with_typecode(lat: float, lon: float, radius: int, typecode: Optiona
     
     try:
         req = urllib.request.Request(url, headers={"Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=15, context=ctx) as response:
+        with urllib.request.urlopen(req, timeout=_bounded_timeout(15), context=ctx) as response:
             data = json.loads(response.read().decode("utf-8", errors="replace"))
             
             if data.get("status") != "1":
                 error_info = data.get("info", "Unknown error")
-                print(f"Amap POI API error: {error_info}")
+                print(f"Amap POI API error: {error_info}", file=sys.stderr)
                 return []
             
             pois = data.get("pois", [])
@@ -334,16 +351,16 @@ def _search_with_typecode(lat: float, lon: float, radius: int, typecode: Optiona
                         "adcode": poi.get("adcode", ""),
                     })
                 except (ValueError, TypeError) as e:
-                    print(f"Parse POI error: {e}")
+                    print(f"Parse POI error: {e}", file=sys.stderr)
                     continue
             
             return results
             
     except urllib.error.URLError as e:
-        print(f"Request failed: {e}")
+        print(f"Request failed: {e}", file=sys.stderr)
         return []
     except Exception as e:
-        print(f"Unexpected error: {e}")
+        print(f"Unexpected error: {e}", file=sys.stderr)
         return []
 
 
