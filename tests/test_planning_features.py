@@ -55,6 +55,8 @@ class PlanningFeatures(unittest.TestCase):
         self.assertEqual(parsed["budget_max"], 100)
         self.assertEqual(parsed["stay_minutes"], 120)
         self.assertEqual(parsed["visit_at"], "2026-10-03T19:00:00+08:00")
+        poi = candidate(business={"opentime_today": "09:00-22:00", "observed_at": "2026-10-03T04:00:00Z"})
+        self.assertEqual(rules.opening_check(parsed, poi)[0], "met")
         args = SimpleNamespace(query=query, origin=None, category=None, preferences=None, constraints=None, avoid=None, location_policy="disabled")
         req = planner.parse_request(args)
         self.assertEqual(req["origin"], "天津财经大学")

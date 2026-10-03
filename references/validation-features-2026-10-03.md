@@ -14,7 +14,7 @@ python3 -m compileall -q scripts tests
 git diff --check
 ```
 
-50 tests passed locally on Python 3.14.7. These include the previous 27 regressions
+50 tests passed locally on Python 3.10.18 and 3.14.7. These include the previous 27 regressions
 and 23 functional cases covering natural Chinese requests, explicit flags,
 negation and hard/soft distinctions, invalid inputs before location access,
 budget boundaries and missing prices, continuous/split/overnight hours, missing
@@ -24,6 +24,9 @@ pagination, v3 fallback, partial errors, and CLI/rendered decisions.
 Two independent read-only reviews identified unparsed half-hour stays and lost
 failure state on a failed synonym search. Both were repaired and regression-tested.
 A shop-name regression also prevents “一点点” from becoming a 01:00 arrival time.
+The first CI run exposed Python 3.10's lack of `fromisoformat` support for the UTC
+suffix `Z`. Arrival and observation timestamps now normalize that suffix to
+`+00:00`; the full suite was rerun with an actual local Python 3.10 interpreter.
 
 ## Real provider acceptance
 

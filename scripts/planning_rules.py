@@ -63,6 +63,11 @@ def parse_radius(text, default=3000):
     return int(number(match[1]) * (1000 if match[2].lower() in {"km", "公里", "千米"} else 1))
 
 
+def parse_iso_datetime(value):
+    # Python 3.10 fromisoformat does not accept the ISO UTC suffix Z.
+    return datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
+
+
 def parse_requirements(args, query, now=None):
     timezone = getattr(args, "timezone", "Asia/Shanghai")
     tz = ZoneInfo(timezone)
@@ -120,7 +125,7 @@ def parse_requirements(args, query, now=None):
     visit = None
     time_unresolved = False
     if visit_arg:
-        visit = datetime.fromisoformat(visit_arg)
+        visit = parse_iso_datetime(visit_arg)
         visit = visit.replace(tzinfo=tz) if visit.tzinfo is None else visit.astimezone(tz)
     else:
         # Require a date/period or a clause/time cue, so shop names such as
@@ -197,13 +202,13 @@ def _intervals(text):
 
 def opening_check(req, poi):
     business = poi.get("business") or {}
-    visit = datetime.fromisoformat(req["visit_at"]).astimezone(ZoneInfo(req.get("timezone", "Asia/Shanghai")))
+    visit = parse_iso_datetime(req["visit_at"]).astimezone(ZoneInfo(req.get("timezone", "Asia/Shanghai")))
     observed = business.get("observed_at") or poi.get("observed_at")
     today = business.get("opentime_today")
     # Provider "today" hours cannot establish tomorrow's schedule or yesterday's carry-over.
     if today and observed:
         try:
-            observed_date = datetime.fromisoformat(observed).astimezone(visit.tzinfo).date()
+            observed_date = parse_iso_datetime(observed).astimezone(visit.tzinfo).date()
         except ValueError:
             observed_date = None
         if visit.date() != observed_date:
