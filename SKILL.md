@@ -1,6 +1,6 @@
 ---
 name: local-poi-planner
-description: "Plan nearby places for dining, desserts, cafes, malls, and date spots using one local POI planning workflow. Best for queries like “附近有什么适合坐着聊天的咖啡店”, “帮我找地铁可达的甜品店”, or “规划一个适合约会的商场/餐厅”. Uses a single orchestrated flow: structured POI recall (Amap-first with OSM fallback) → anchor expansion → unified-search evidence → scoring → fallback to area-level recommendations when store-level data is weak."
+description: "Plan nearby places for dining, desserts, cafes, malls, and date spots using one local POI planning workflow. Best for queries like “附近有什么适合坐着聊天的咖啡店”, “帮我找地铁可达的甜品店”, or “规划一个适合约会的商场/餐厅”. Uses structured POI recall (Amap-first with OSM fallback), budget and opening-time checks, hard requirements, preference ranking, and unified-search evidence; missing evidence remains pending."
 metadata:
   openclaw:
     requires:
@@ -37,9 +37,10 @@ This skill is a **single top-level skill**. Internally it may call the existing 
    - origin (see Location Resolution below)
    - category (see Category Resolution below)
    - preferences
-   - constraints
+   - hard constraints (`--must` / `--constraints`) versus soft preferences
+   - per-person CNY reference budget, arrival time/timezone, continuous stay
    - avoid rules
-2. Recall nearby candidates from a structured POI source (currently Amap-first with OSM fallback)
+2. Recall nearby candidates from a structured POI source (Amap-first with OSM fallback), with bounded pagination and category synonym searches at the requested radius; deduplicate and rank the pool before shortlisting.
 3. Expand the origin into nearby anchors (mall / road / station / area)
 4. Generate multiple local search queries
 5. Run `unified-search` over those queries and top POI candidates
@@ -50,7 +51,8 @@ This skill is a **single top-level skill**. Internally it may call the existing 
    - top pick
    - backups
    - not recommended / weak-evidence notes
-   - fallback area-level guidance if store-level evidence is weak
+   - pending and excluded candidates with the evidence for each condition
+   - optional area clues if store-level evidence is weak; never present an area as a store satisfying hard conditions
 
 ### Category Resolution
 
@@ -112,27 +114,57 @@ python3 scripts/planner.py \
 
 ## Output contract
 
+### Request and evidence rules
+
+- `--must` and `--constraints` are comma-separated hard requirements. `--preferences`
+  affects ranking using matched store names/structured attributes. Natural “必须”
+  is hard, “优先/最好/尽量” is soft; subjective quiet/environment defaults to soft.
+- `--budget-max` means maximum reference CNY cost per person. Missing/zero cost is
+  unknown, not free. Keep “reference price, not a quote” visible in the answer.
+- `--visit-at` is an ISO arrival date/time, with `--timezone Asia/Shanghai` by
+  default for naive input. Use the destination's IANA timezone outside China.
+  `--stay-minutes` (0–1440) checks continuous coverage. Natural “今晚七点”,
+  “明天下午三点半”, “半小时”, and “一个半小时” are supported; unresolved date,
+  budget, or duration expressions remain pending and appear in `request_warnings`.
+- Amap v5 `business.cost` and `opentime_today` are preserved with a source and fetch
+  timestamp. If v5 fails, v3 business data may be more limited. “Today” is only
+  usable for the fetch date in the selected timezone; complex schedules and future
+  dates remain unknown. A supported schedule is not confirmation of live opening.
+- Seat availability, quietness, mall membership, and station proximity are often
+  missing from provider data. Keep them unknown. Generic web snippets and shop-name
+  matches do not confirm those hard requirements. `metro` checks the returned
+  route for subway use, while `near_metro` needs station-distance data (≤500 m).
+- `--radius-m` (1–50000) overrides natural radius parsing. Recall never expands it.
+  Up to three pages per term and at most two extra category terms are supported;
+  the unique pool is capped at 75 (45 in search / 25 in recommend currently).
+  All collected POIs are ranked before truncation; route enrichment is bounded to
+  twice the shortlist. A failed page/term reports partial recall.
+
 `--poi-only` skips web enrichment and specialty web fallback and reports web status
 `not_run`. `scripts/quick_search.py` is a convenience entrypoint with this option
 and `--mode search` enabled by default; all ordinary planner flags remain available.
 It still calls map services and any location source allowed by `--location-policy`.
 
-The planner returns either:
-- **store-level recommendation** when evidence is sufficient, or
-- **area-level fallback** when exact shop hits are weak.
+The planner returns a store-level recommendation only when the store meets every
+hard condition and has sufficient store-level web evidence. Otherwise `top_pick`
+is `null`, with eligible candidates, pending checks, exclusions, and optional area
+clues available separately. Never turn a pending candidate into a confirmed pick.
 
 In JSON mode, the top-level payload contains `status`, `request`, `poi_provider`, `queries`, and `result`:
 - `status.overall`: `success`, `empty`, `partial`, or `error`; `status.components.poi` and `status.components.web_search` summarize each stage.
-- `request`: normalized query, origin, category, radius, preferences, constraints, and avoid rules. A source IP from IP geolocation is omitted.
+- `request`: normalized query, origin, category, radius, preferences, constraints, avoid rules, `budget_max`, `visit_at`, `stay_minutes`, `timezone`, and parsing warnings. A source IP from IP geolocation is omitted.
 - `poi_provider`: structured POI provider, resolved origin, candidates, errors, and `fallback_from` when Amap falls back to Overpass.
 - `queries`: web queries attempted. `result` keeps the existing mode-specific recommendation/search fields and per-candidate evidence, accessibility, and constraint assessments.
+- `result.planning_status`: `matched`, `pending_verification`, `no_match`, or `no_candidates`; this is separate from execution `status`.
+- `result.results` / `result.poi_candidates`: eligible stores only. `pending_verification` holds missing-evidence candidates; `excluded_candidates` holds known failures. `candidate_counts` describes this bounded shortlist, while `poi_provider.candidate_pool_size` describes recall.
+- Per candidate: `requirement_checks` has `met` / `not_met` / `unknown` states plus reason, source and fetch timestamp; `matched_preferences`, `preference_score`, `ranking_score`, and `recommendation_reasons` explain ordering. The preference bonus is capped at 24; scores are not probabilities.
 
 Treat provider and candidate fields as additive: consumers should ignore unknown fields and use the explicit component status to distinguish an empty result from a failed or partial lookup.
 
 Confidence levels:
 - `high`: repeated store-level hits with supporting evidence
 - `medium`: usable candidates but some ambiguity
-- `low`: fallback area recommendation only
+- `low`: limited web evidence or unresolved requirements; no confirmed store pick
 
 ## Internal dependency
 
@@ -175,7 +207,7 @@ See `references/lessons-2026-05-31.md` for hard-won debugging notes:
 
 - Prefer one final recommendation workflow, not fragmented sub-skills
 - If exact local store evidence is weak, **do not hallucinate shop names**
-- Fallback to area / mall / anchor recommendation with explicit uncertainty
+- Area / mall / anchor clues must stay separate from store picks and cannot bypass hard requirements
 - Use concise decision output:
   - 首选
   - 备选

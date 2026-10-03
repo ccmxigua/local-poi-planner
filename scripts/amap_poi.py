@@ -4,6 +4,7 @@ Amap POI Provider - 高德地图POI搜索
 使用 typecode 精确搜索，替代模糊的关键词搜索
 """
 import json
+import math
 import ssl
 import sys
 import time
@@ -11,6 +12,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Dict, List, Optional
+from datetime import datetime, timezone
+
+from coordinates import valid_coordinates
 
 # POI Typecode Mapping - 高德地图POI分类编码
 # 一级大类共 20 个（6位宽码 = XX0000）:
@@ -193,6 +197,7 @@ TYPECODE_MAP = {
 DEFAULT_TYPECODES = "050000"  # 默认: 餐饮大类
 
 API_URL = "https://restapi.amap.com/v3/place/around"
+API_V5_URL = "https://restapi.amap.com/v5/place/around"
 _REQUEST_DEADLINE = None
 
 
@@ -246,10 +251,10 @@ def search_by_keywords(keywords: str, center_lng: float, center_lat: float, radi
     向后兼容的接口，供 providers.py 调用
     将 keywords 转换为 typecode 后搜索
     """
-    return search(center_lat, center_lng, radius, keywords)[:limit]
+    return search(center_lat, center_lng, radius, keywords, limit=limit)
 
 
-def search(lat: float, lon: float, radius: int = 3000, keyword: str = "") -> List[Dict]:
+def search(lat: float, lon: float, radius: int = 3000, keyword: str = "", limit: int = 25) -> List[Dict]:
     """
     搜索附近POI (使用组合查询：typecode + keywords 同时传，服务端过滤)
     
@@ -270,98 +275,122 @@ def search(lat: float, lon: float, radius: int = 3000, keyword: str = "") -> Lis
         # 纯关键词搜索 — 不传 typecode。
         # typecode 过于粗糙（如 080000 把酒吧+网吧+KTV+影吧混在一起），
         # 会污染关键词精度（搜"酒吧"混入网吧）。关键词本身信号足够。
-        return _search_with_typecode(lat, lon, radius, None, keywords=keyword)
+        return _search_with_typecode(lat, lon, radius, None, keywords=keyword, limit=limit)
     
     # 无关键词 → 用默认 typecode 做宽泛搜索
-    results = _search_with_typecode(lat, lon, radius, DEFAULT_TYPECODES)
+    results = _search_with_typecode(lat, lon, radius, DEFAULT_TYPECODES, limit=limit)
     if not results:
-        results = _search_with_typecode(lat, lon, radius, "050000")
+        results = _search_with_typecode(lat, lon, radius, "050000", limit=limit)
     return results
 
 
 
-def _search_with_typecode(lat: float, lon: float, radius: int, typecode: Optional[str] = None, keywords: str = "") -> List[Dict]:
-    """
-    底层API调用：使用指定typecode搜索，支持同时传入keywords进行服务端过滤
-    
-    组合查询优势：
-    - keywords和types同时作用，Amap服务端进行AND逻辑过滤
-    - 比本地过滤更智能，支持品牌名匹配（如"益禾堂"）
-    - 减少API调用次数
+class SearchResults(list):
+    """List-compatible response carrying failure state even when no POIs survived."""
+
+    def __init__(self, values=(), partial=False):
+        super().__init__(values)
+        self.partial = partial
+
+
+def _fetch_page(params, version):
+    url = API_V5_URL if version == 5 else API_URL
+    request = urllib.request.Request(url + "?" + urllib.parse.urlencode(params), headers={"Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=_bounded_timeout(15), context=ssl.create_default_context()) as response:
+            data = json.loads(response.read().decode("utf-8", errors="replace"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _normalize_poi(poi, version, observed_at):
+    try:
+        lon, lat = poi.get("location", "").split(",")
+        if not valid_coordinates(lat, lon) or not poi.get("name"):
+            return None
+        distance = float(poi["distance"]) if poi.get("distance") not in (None, "", []) else None
+        if distance is not None and (not math.isfinite(distance) or distance < 0):
+            distance = None
+    except (ValueError, TypeError, AttributeError):
+        return None
+    business = poi.get("business") or poi.get("biz_ext") or {}
+    if not isinstance(business, dict):
+        business = {}
+    metadata = {field: business.get(field) for field in ("cost", "rating", "tag", "opentime_today", "opentime_week") if business.get(field) not in (None, "", [])}
+    metadata["observed_at"] = observed_at
+    return {
+        "id": poi.get("id"), "name": poi["name"], "lat": float(lat), "lon": float(lon),
+        "address": poi.get("address", ""), "type": poi.get("type", ""),
+        "typecode": poi.get("typecode", ""), "distance": distance,
+        "tel": business.get("tel") or poi.get("tel", ""),
+        "pcode": poi.get("pcode", ""), "citycode": poi.get("citycode", ""),
+        "adcode": poi.get("adcode", ""), "business": metadata,
+        "data_source": f"amap_poi_v{version}", "observed_at": observed_at,
+    }
+
+
+def poi_identity(poi):
+    if poi.get("id"):
+        return ("id", poi["id"])
+    return (poi.get("name"), round(poi["lat"], 5), round(poi["lon"], 5))
+
+
+def _search_with_typecode(lat: float, lon: float, radius: int, typecode: Optional[str] = None, keywords: str = "", limit: int = 25) -> List[Dict]:
+    """Fetch up to three pages at a fixed radius, retaining business evidence.
+
+    v5 exposes explicit business fields. On an initial v5 failure, retry v3 with
+    extensions=all; unavailable fields remain absent rather than being invented.
     """
     key = _load_key()
-    if not key:
+    if not key or limit <= 0:
         return []
-    
-    params = {
-        "key": key,
-        "location": f"{lon},{lat}",
-        "radius": radius,
-        "offset": 25,
-        "page": 1,
-        "output": "json",
-    }
-    
+    limit = min(limit, 75)
+    base = {"key": key, "location": f"{lon},{lat}", "radius": radius, "output": "json"}
     if typecode:
-        params["types"] = typecode
-    
-    # 组合查询：同时传入keywords，让服务端完成过滤
+        base["types"] = typecode
     if keywords:
-        params["keywords"] = keywords
-    
-    query_string = urllib.parse.urlencode(params)
-    url = f"{API_URL}?{query_string}"
-    
-    ctx = ssl.create_default_context()
-    
-    try:
-        req = urllib.request.Request(url, headers={"Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=_bounded_timeout(15), context=ctx) as response:
-            data = json.loads(response.read().decode("utf-8", errors="replace"))
-            
-            if data.get("status") != "1":
-                error_info = data.get("info", "Unknown error")
-                print(f"Amap POI API error: {error_info}", file=sys.stderr)
-                return []
-            
-            pois = data.get("pois", [])
-            if not pois:
-                return []
-            
-            results = []
-            for poi in pois:
-                try:
-                    location = poi.get("location", "").split(",")
-                    if len(location) != 2:
-                        continue
-                    
-                    poi_lon, poi_lat = float(location[0]), float(location[1])
-                    
-                    results.append({
-                        "name": poi.get("name", ""),
-                        "lat": poi_lat,
-                        "lon": poi_lon,
-                        "address": poi.get("address", ""),
-                        "type": poi.get("type", ""),
-                        "typecode": poi.get("typecode", ""),
-                        "distance": int(poi.get("distance", 0)),
-                        "tel": poi.get("tel", ""),
-                        "pcode": poi.get("pcode", ""),
-                        "citycode": poi.get("citycode", ""),
-                        "adcode": poi.get("adcode", ""),
-                    })
-                except (ValueError, TypeError) as e:
-                    print(f"Parse POI error: {e}", file=sys.stderr)
-                    continue
-            
-            return results
-            
-    except urllib.error.URLError as e:
-        print(f"Request failed: {e}", file=sys.stderr)
-        return []
-    except Exception as e:
-        print(f"Unexpected error: {e}", file=sys.stderr)
-        return []
+        base["keywords"] = keywords
+    version = 5
+    results, seen = [], set()
+    partial = False
+    for page in range(1, 4):
+        if _REQUEST_DEADLINE is not None and time.monotonic() >= _REQUEST_DEADLINE:
+            partial = True
+            break
+        params = dict(base)
+        params.update({"page_num": page, "page_size": 25, "show_fields": "business"} if version == 5 else {"page": page, "offset": 25, "extensions": "all"})
+        data = _fetch_page(params, version)
+        if page == 1 and version == 5 and data.get("status") != "1":
+            version = 3
+            params = dict(base, page=page, offset=25, extensions="all")
+            data = _fetch_page(params, version)
+        if data.get("status") != "1" or not isinstance(data.get("pois"), list):
+            print("Amap POI page unavailable; retaining fetched candidates", file=sys.stderr)
+            partial = True
+            break
+        raw_pois = data["pois"]
+        observed = datetime.now(timezone.utc).isoformat()
+        added = 0
+        for raw in raw_pois:
+            if not isinstance(raw, dict):
+                continue
+            poi = _normalize_poi(raw, version, observed)
+            if not poi:
+                continue
+            identity = poi_identity(poi)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            results.append(poi)
+            added += 1
+        if len(results) >= limit or len(raw_pois) < 25 or not added:
+            break
+    if partial:
+        for item in results:
+            item["recall_partial"] = True
+    return SearchResults(results[:limit], partial=partial)
+
 
 
 def test_search():

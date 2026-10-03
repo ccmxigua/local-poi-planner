@@ -44,6 +44,53 @@ python3 scripts/quick_search.py --origin "天津财经大学" --category cafe \
 it skips unified-search and specialty web fallback. JSON stdout contains one document;
 progress is written to stderr. Inspect `status` for empty, partial, or failed results.
 
+## Conditions that affect the result
+
+```bash
+python3 scripts/quick_search.py --origin "天津财经大学" --category cafe \
+  --budget-max 100 --visit-at "2026-10-03T19:00:00" --stay-minutes 90 \
+  --radius-m 3000 --preferences quiet --location-policy disabled --format markdown
+
+python3 scripts/planner.py \
+  --query "今晚七点，从天津财经大学出发，找咖啡，人均一百以内，必须有座位，优先清静，三公里以内，待一个半小时" \
+  --location-policy disabled --format json
+```
+
+- `--must` / `--constraints` are hard requirements; `--preferences` changes ranking.
+  Known aliases include `seating`, `metro`, `near_metro`, `mall`, `quiet`, and
+  `environment`. Explicit failures are excluded. Missing evidence stays pending,
+  even if a web result mentions the shop. `metro` checks the returned route for
+  a subway segment; `near_metro` requires station-distance evidence within 500 m.
+- `--budget-max` is a positive **CNY reference cost per person**. Missing or zero
+  cost is unknown; a map reference price is not a current quote.
+- `--visit-at` accepts an ISO date/time. Naive values use `--timezone`
+  (default `Asia/Shanghai`). `--stay-minutes` checks a continuous stay, including
+  closing boundaries and midnight. Amap's *today* hours only establish the fetched
+  day's schedule; future dates and complex weekly hours remain unknown. Use the
+  destination timezone outside China. These are schedule checks, not live status.
+- Natural requests support today/tomorrow evening, Chinese numbers, “半小时” and
+  “一个半小时”. Unsupported time/budget expressions produce warnings and pending
+  checks; explicit flags are the reliable interface for precise requests.
+- Recall uses a fixed radius (1–50,000 m), bounded Amap pagination and category
+  synonym searches when the pool is short. It deduplicates and ranks the collected
+  pool before selecting a shortlist; it never silently expands the radius.
+  Amap v5 business fields are retained, with v3 fallback when v5 is unavailable.
+
+Execution success and finding a suitable place are separate:
+`result.planning_status` is `matched`, `pending_verification`, `no_match`, or
+`no_candidates`. `results` / `poi_candidates` contain eligible stores;
+`pending_verification` and `excluded_candidates` explain the rest. A recommendation
+has `top_pick: null` until an eligible store also has sufficient store-level web
+evidence. Each candidate includes `requirement_checks`, `matched_preferences`,
+`recommendation_reasons`, and source/fetch timestamps. `ranking_score` adds up to
+24 preference points to the base/web/route score; it is not a probability.
+
+The recall pool is capped at 75 unique POIs (currently 45 for search, 25 for
+recommendation), up to three pages per term. Route enrichment is limited to twice
+the output shortlist. `candidate_pool_size` describes recall; `candidate_counts`
+describes the returned shortlist, not every business in the area. Partial page or
+synonym failures retain usable candidates and report `partial`.
+
 Numeric origins use **latitude,longitude** and default to WGS84. Coordinates copied
 from Amap require `--coordinate-system gcj02`. Automatic location providers attach
 their own coordinate system. WGS84 points are converted through Amap's supported

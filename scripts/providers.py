@@ -8,8 +8,10 @@ import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
+from datetime import datetime, timezone
 
 from coordinates import valid_coordinates
+from planning_rules import rank_candidates
 
 # Load .env.local if exists
 SCRIPT_DIR = Path(__file__).parent.resolve()
@@ -682,31 +684,32 @@ def search_overpass(req, origin_name, radius_m=2200, limit=8, enable_accessibili
             "distance_m": int(haversine_m(origin["lat"], origin["lon"], lat, lon)),
             "provider": "osm_overpass",
             "coordinate_system": "wgs84",
+            "data_source": "osm_overpass",
+            "observed_at": datetime.now(timezone.utc).isoformat(),
         }
         poi["score"] = rank_poi(req, poi, origin, anchors)
         results.append(poi)
 
-    if enable_accessibility and AMAP_AVAILABLE and results:
+    results = rank_candidates(req, results)
+    shortlist = [p for p in results if p["eligibility"] != "excluded"][:limit * 2]
+    if enable_accessibility and AMAP_AVAILABLE and shortlist:
         try:
-            results = _enrich_osm_accessibility(results, origin)
+            _enrich_osm_accessibility(shortlist, origin)
         except Exception:
             pass
 
     # A conversion can fail for just one candidate. Unenriched candidates keep
     # their base score; never choose the ranking method from the first item.
-    results.sort(key=lambda x: (
-        -x.get("total_score", x.get("score", 0)),
-        x.get("accessibility", {}).get("duration_min", 999),
-        x.get("distance_m", 99999),
-    ))
+    results = rank_candidates(req, results)
 
-    return {"provider": "osm_overpass", "origin": origin, "results": results[:limit], "error": None}
+    return {"provider": "osm_overpass", "origin": origin, "results": results[:limit], "candidate_pool_size": len(results), "error": None}
 
 
 def _format_amap_pois(pois, req, ref_lat, ref_lon, anchors, limit, enable_accessibility=True):
     """Format raw Amap POI results with filtering, scoring, and accessibility enrichment."""
     from planner import rank_poi
     results = []
+    seen = set()
     category = normalize_category(req.get("category", "restaurant"))
 
     for poi in pois:
@@ -720,7 +723,7 @@ def _format_amap_pois(pois, req, ref_lat, ref_lon, anchors, limit, enable_access
             distance_m = poi.get("distance")
         try:
             distance_m = int(float(distance_m)) if distance_m not in (None, "") else None
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             distance_m = None
         try:
             poi_lat = float(poi.get("lat"))
@@ -729,10 +732,15 @@ def _format_amap_pois(pois, req, ref_lat, ref_lon, anchors, limit, enable_access
             continue
         if not (math.isfinite(poi_lat) and math.isfinite(poi_lon) and -90 <= poi_lat <= 90 and -180 <= poi_lon <= 180):
             continue
-        if distance_m is None:
+        if distance_m is None or distance_m < 0:
             distance_m = int(haversine_m(ref_lat, ref_lon, poi_lat, poi_lon))
+        identity = poi.get("id") or (poi.get("name"), round(poi_lat, 5), round(poi_lon, 5))
+        if identity in seen:
+            continue
+        seen.add(identity)
 
         formatted_poi = {
+            "id": poi.get("id"),
             "name": poi.get("name"),
             "lat": poi_lat,
             "lon": poi_lon,
@@ -742,6 +750,9 @@ def _format_amap_pois(pois, req, ref_lat, ref_lon, anchors, limit, enable_access
             "provider": "amap_poi",
             "coordinate_system": "gcj02",
             "typecode": poi.get("typecode"),
+            "business": poi.get("business") or {},
+            "data_source": poi.get("data_source", "amap_poi"),
+            "observed_at": poi.get("observed_at"),
             "tags": {
                 "name": poi.get("name"),
                 "amenity": "restaurant" if category == "restaurant" else category,
@@ -752,21 +763,48 @@ def _format_amap_pois(pois, req, ref_lat, ref_lon, anchors, limit, enable_access
         formatted_poi["score"] = rank_poi(req, formatted_poi, {"lat": ref_lat, "lon": ref_lon}, anchors)
         results.append(formatted_poi)
 
-        if len(results) >= limit:
-            break
-
-    if enable_accessibility and AMAP_AVAILABLE and results:
+    results = rank_candidates(req, results)
+    shortlist = [p for p in results if p["eligibility"] != "excluded"][:limit * 2]
+    if enable_accessibility and AMAP_AVAILABLE and shortlist:
         try:
-            results = amap_direction.enrich_pois_with_accessibility(results, ref_lon, ref_lat)
+            amap_direction.enrich_pois_with_accessibility(shortlist, ref_lon, ref_lat)
         except Exception:
             pass
 
-    if results and "total_score" in results[0]:
-        results.sort(key=lambda x: (-x.get("total_score", 0), x.get("accessibility", {}).get("duration_min", 999)))
-    else:
-        results.sort(key=lambda x: (-x["score"], x["distance_m"]))
+    return rank_candidates(req, results)[:limit]
 
-    return results
+
+AMAP_RECALL_TERMS = {
+    "cafe": ["咖啡馆"], "dessert": ["冰淇淋", "酸奶"], "tea": ["茶饮"],
+    "bakery": ["烘焙"], "restaurant": ["饭馆"], "电影院": ["影城"], "网吧": ["网咖"],
+}
+
+
+def _recall_amap(req, lat, lon, radius_m, limit):
+    """Bounded pagination/synonym recall; never expand the requested radius."""
+    category = normalize_category(req.get("category", "restaurant"))
+    terms = [AMAP_CATEGORY_KEYWORDS.get(category, category or "餐厅")]
+    terms += AMAP_RECALL_TERMS.get(category, [])
+    pool_limit = min(75, max(25, limit * 3))
+    results, seen = [], set()
+    partial = False
+    for term in terms:
+        if _REQUEST_DEADLINE is not None and time.monotonic() >= _REQUEST_DEADLINE:
+            partial = True
+            break
+        recalled = amap_poi.search_by_keywords(term, lon, lat, radius=radius_m, limit=pool_limit)
+        partial = partial or getattr(recalled, "partial", False) or any(p.get("recall_partial") for p in recalled)
+        for poi in recalled:
+            identity = amap_poi.poi_identity(poi)
+            if identity not in seen:
+                seen.add(identity)
+                results.append(poi)
+        if len(results) >= pool_limit:
+            break
+    if partial:
+        for item in results:
+            item["recall_partial"] = True
+    return amap_poi.SearchResults(results[:pool_limit], partial=partial)
 
 
 def search_amap_poi(req, origin_name, radius_m=3000, limit=8, enable_accessibility=True):
@@ -784,25 +822,17 @@ def search_amap_poi(req, origin_name, radius_m=3000, limit=8, enable_accessibili
     if not AMAP_POI_AVAILABLE:
         return {"provider": "amap_poi", "origin": origin, "results": [], "error": "amap_poi_unavailable"}
 
-    category = normalize_category(req.get("category", "restaurant"))
-    keywords = AMAP_CATEGORY_KEYWORDS.get(category, category or "餐厅")
-
     try:
-        raw_results = amap_poi.search_by_keywords(
-            keywords=keywords,
-            center_lng=origin["lon"],
-            center_lat=origin["lat"],
-            radius=radius_m,
-            limit=limit * 2,
-        )
+        raw_results = _recall_amap(req, origin["lat"], origin["lon"], radius_m, limit)
         if not raw_results:
-            return {"provider": "amap_poi", "origin": origin, "results": [], "error": "empty"}
+            return {"provider": "amap_poi", "origin": origin, "results": [], "error": "search_failed" if getattr(raw_results, "partial", False) else "empty"}
     except Exception as exc:
         return {"provider": "amap_poi", "origin": origin, "results": [], "error": str(exc)}
 
     anchors = load_anchors().get(origin_name, [])
     results = _format_amap_pois(raw_results, req, origin["lat"], origin["lon"], anchors, limit, enable_accessibility)
-    return {"provider": "amap_poi", "origin": origin, "results": results, "error": None}
+    return {"provider": "amap_poi", "origin": origin, "results": results, "candidate_pool_size": len(raw_results),
+            "partial": getattr(raw_results, "partial", False), "error": None}
 
 
 def search_amap_poi_by_coords(req, lat, lon, radius_m=3000, limit=8, enable_accessibility=True, coordinate_system="gcj02"):
@@ -825,23 +855,16 @@ def search_amap_poi_by_coords(req, lat, lon, radius_m=3000, limit=8, enable_acce
         "coordinate_system": "gcj02",
     }
 
-    category = normalize_category(req.get("category", "restaurant"))
-    keywords = AMAP_CATEGORY_KEYWORDS.get(category, category or "餐厅")
-
     try:
-        raw_results = amap_poi.search_by_keywords(
-            keywords=keywords,
-            center_lng=lon,
-            center_lat=lat,
-            radius=radius_m,
-            limit=limit * 2,
-        )
+        raw_results = _recall_amap(req, lat, lon, radius_m, limit)
     except Exception:
         return {"provider": "amap_poi", "origin": origin, "results": [], "error": "search_failed"}
 
     anchors = load_anchors().get("", [])
     results = _format_amap_pois(raw_results or [], req, lat, lon, anchors, limit, enable_accessibility)
-    return {"provider": "amap_poi", "origin": origin, "results": results, "error": None}
+    return {"provider": "amap_poi", "origin": origin, "results": results, "candidate_pool_size": len(raw_results),
+            "partial": getattr(raw_results, "partial", False),
+            "error": "search_failed" if not raw_results and getattr(raw_results, "partial", False) else None}
 
 
 def _maoyan_http_get(url, params=None, timeout=15):

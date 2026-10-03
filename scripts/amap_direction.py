@@ -11,6 +11,7 @@ import time
 import urllib.parse
 import urllib.request
 from typing import Dict, Optional, Tuple
+from datetime import datetime, timezone
 
 # Try to load from .env.local without overriding the process environment.
 def _load_env_file():
@@ -404,7 +405,14 @@ def get_transit_time(origin_lng: float, origin_lat: float,
         "mode": "transit",
         "score": score,
         "display": display,
-        "segments": segments
+        "segments": segments,
+        "data_source": "amap_direction",
+        "observed_at": datetime.now(timezone.utc).isoformat(),
+        "has_subway": any(
+            "地铁" in str(line.get("type", "")) or "subway" in str(line.get("type", "")).lower()
+            for segment in best.get("segments", [])
+            for line in ((segment.get("bus") or {}).get("buslines") or [])
+        ),
     }
 
 

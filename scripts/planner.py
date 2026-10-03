@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from providers import normalize_category, search_pois, set_request_deadline, amap_coordinates
+from planning_rules import ALIASES, PREFERENCE_TERMS, parse_requirements, parse_radius, rank_candidates, assess_candidate
 
 try:
     from amap_ip_location import get_ip_location
@@ -147,19 +148,8 @@ MODE_ALIASES = {
     "recommend": "recommend",
 }
 
-PREFERENCE_HINTS = {
-    "yogurt": ["酸奶", "yogurt"],
-    "gelato": ["gelato", "手工冰淇淋", "意式冰淇淋"],
-    "smoothie": ["冰沙", "果昔", "smoothie"],
-    "light": ["清爽", "不腻", "轻食感"],
-}
-
-CONSTRAINT_HINTS = {
-    "metro": ["地铁可达", "近地铁", "地铁站附近"],
-    "seating": ["有座位", "堂食", "能坐着"],
-    "environment": ["环境好", "适合约会", "安静", "适合聊天"],
-    "mall": ["商场", "购物中心", "mall"],
-}
+PREFERENCE_HINTS = PREFERENCE_TERMS
+CONSTRAINT_HINTS = ALIASES
 
 AVOID_HINTS = {
     "night_market": ["夜市", "小吃街"],
@@ -168,7 +158,6 @@ AVOID_HINTS = {
 }
 
 CITYISH_RE = re.compile(r"(city8\.com|城市吧|map|地图|购物中心|商场|店|餐厅|饭馆|美食|甜品|冰淇淋|咖啡)", re.I)
-RADIUS_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(km|KM|公里|千米|m|M|米)")
 EXPLICIT_MODE_RE = re.compile(r"\bmode\s*=\s*(search|recommend)\b", re.I)
 
 SEARCH_HINTS = ["有哪些", "附近有什么", "帮我找", "找找", "列几个", "列出", "给我看看", "周边", "附近的", "附近", "2km", "1km", "3km"]
@@ -292,16 +281,7 @@ def split_csv(s):
 
 
 def parse_radius_m(text: str, default_m: int = 3000):
-    if not text:
-        return default_m
-    m = RADIUS_RE.search(text)
-    if not m:
-        return default_m
-    value = float(m.group(1))
-    unit = m.group(2).lower()
-    if unit in {"km", "公里", "千米"}:
-        return int(value * 1000)
-    return int(value)
+    return parse_radius(text, default_m)
 
 
 def clean_origin_text(origin: str):
@@ -337,9 +317,12 @@ def clean_origin_text(origin: str):
 
 def parse_request(args, deadline=None):
     query = args.query or ""
+    requirements = parse_requirements(args, query)
     origin = args.origin
     if not origin and query:
-        m = re.search(r"(.+?)(附近|周边|出发)", query)
+        m = re.search(r"从([^，,。；;]+?)出发", query)
+        if not m:
+            m = re.search(r"([^，,。；;]+?)(附近|周边|出发)", query)
         if m:
             origin = clean_origin_text(m.group(1))
     positive_query = _strip_negated_category_terms(query)
@@ -348,27 +331,14 @@ def parse_request(args, deadline=None):
         raw_cat = _extract_fallback_keywords(positive_query) or "restaurant"
     category = normalize_category(raw_cat)
     mode = normalize_mode(getattr(args, "mode", None)) or infer_mode(query)
-    preferences = split_csv(args.preferences)
-    constraints = split_csv(args.constraints)
     avoid = split_csv(args.avoid)
-    radius_m = parse_radius_m(query)
-    if radius_m == 3000:
-        for c in constraints:
-            candidate = parse_radius_m(c)
-            if candidate != 3000:
-                radius_m = candidate
-                break
-
-    if query and not preferences:
-        q = query.lower()
-        for key, hints in PREFERENCE_HINTS.items():
-            if any(h in q for h in [x.lower() for x in hints]):
-                preferences.append(key)
-    if query and not constraints:
-        q = query.lower()
-        for key, hints in CONSTRAINT_HINTS.items():
-            if any(h.lower() in q for h in hints):
-                constraints.append(key)
+    radius_m = getattr(args, "radius_m", None)
+    if radius_m is None:
+        radius_m = parse_radius_m(query, None)
+    if radius_m is None:
+        radius_m = parse_radius_m(args.constraints or "", 3000)
+    if not 1 <= radius_m <= 50000:
+        raise ValueError("--radius-m must be between 1 and 50000")
     if query and not avoid:
         q = query.lower()
         negative = r"(?:不要|不想要|不想|不喜欢|避开|排除|别去|不去|别要)"
@@ -403,8 +373,7 @@ def parse_request(args, deadline=None):
         "category": category,
         "mode": mode,
         "radius_m": radius_m,
-        "preferences": sorted(set(preferences)),
-        "constraints": sorted(set(constraints)),
+        **requirements,
         "avoid": sorted(set(avoid)),
         "ip_location": ip_location,
         "coordinate_system": getattr(args, "coordinate_system", "wgs84"),
@@ -838,10 +807,9 @@ def enrich_poi_with_web(req, pois, verify_limit=2, deadline=None):
         p["web_status"] = "not_checked"
         p["total_score"] = int(p["_base_score"])
 
-    poi_list.sort(key=lambda x: (-x.get("total_score", 0), x.get("distance_m", 99999)))
     for p in poi_list:
         p.pop("_base_score", None)
-    return poi_list
+    return rank_candidates(req, poi_list)
 
 
 def _build_evidence_bundles(req, search_runs):
@@ -865,7 +833,7 @@ def _execution_status(poi_result, search_runs, enriched_pois=None):
     if poi_result.get("error"):
         poi_status = "error"
     elif poi_results:
-        poi_status = "partial" if poi_result.get("fallback_from") else "success"
+        poi_status = "partial" if poi_result.get("fallback_from") or poi_result.get("partial") else "success"
     else:
         poi_status = "empty"
 
@@ -1008,29 +976,45 @@ def _confidence_band(results):
     return "low"
 
 
+def _partition_candidates(req, candidates):
+    ranked = rank_candidates(req, candidates)
+    eligible = [p for p in ranked if p["eligibility"] == "eligible"]
+    pending = [p for p in ranked if p["eligibility"] == "needs_verification"]
+    excluded = [p for p in ranked if p["eligibility"] == "excluded"]
+    status = "matched" if eligible else "pending_verification" if pending else "no_match" if excluded else "no_candidates"
+    return eligible, {
+        "planning_status": status,
+        "pending_verification": pending[:SEARCH_DISPLAY_LIMIT],
+        "excluded_candidates": excluded[:SEARCH_DISPLAY_LIMIT],
+        "candidate_counts": {"eligible": len(eligible), "pending": len(pending), "excluded": len(excluded)},
+    }
+
+
 def decide_search(req, poi_result, search_runs, enriched_pois):
     bundles = _build_evidence_bundles(req, search_runs)
-    anchors = expand_anchors(req["origin"])
-    results = enriched_pois[:SEARCH_DISPLAY_LIMIT]
+    eligible, assessment = _partition_candidates(req, enriched_pois)
+    results = eligible[:SEARCH_DISPLAY_LIMIT]
 
     if not results:
         return {
             "status": "ok",
             "mode": "search",
-            "resolution_mode": "area_fallback",
+            **assessment,
+            "resolution_mode": assessment["planning_status"],
             "confidence_band": "low",
-            "summary": "结构化 POI 未返回稳定结果，当前只能回退到区域级线索。",
-            "top_candidates": anchors[:2],
+            "summary": "暂无已确认符合全部硬条件的候选；请查看待确认及排除原因。" if enriched_pois else "结构化 POI 未返回候选，请检查起点、类别或检索状态。",
+            "top_candidates": [],
             "results": [],
             "evidence": bundles[:2],
         }
 
     top_candidates = [p["name"] for p in results[:3]]
-    checked_count = sum(1 for p in results if p.get("web_status") != "not_checked")
-    summary = f"共找到 {len(results)} 个候选，优先看 {', '.join(top_candidates)}。已尝试对其中 {checked_count} 个候选做网页补充检索；店名匹配状态见候选字段。"
+    checked_count = sum(1 for p in results if p.get("web_status") not in {None, "not_checked"})
+    summary = f"展示 {len(results)} 个符合已核验硬条件的候选，优先看 {', '.join(top_candidates)}。已尝试对其中 {checked_count} 个候选做网页补充检索。另有 {assessment['candidate_counts']['pending']} 个待确认、{assessment['candidate_counts']['excluded']} 个被排除。"
     return {
         "status": "ok",
         "mode": "search",
+        **assessment,
         "resolution_mode": "list",
         "confidence_band": _confidence_band(results),
         "summary": summary,
@@ -1041,6 +1025,26 @@ def decide_search(req, poi_result, search_runs, enriched_pois):
 
 
 def decide_recommend(req, poi_result, search_runs, enriched_pois):
+    eligible, assessment = _partition_candidates(req, enriched_pois)
+    result = _decide_recommend_with_evidence(req, poi_result, search_runs, eligible)
+    result.update(assessment)
+    if result["resolution_mode"] != "store_level":
+        # Area-level evidence cannot stand in for a store meeting hard conditions.
+        result["suggested_areas"] = expand_anchors(req["origin"])[:2] if eligible else []
+        result["top_pick"] = None
+        result["backups"] = []
+        result["resolution_mode"] = "candidate_only" if eligible else assessment["planning_status"]
+        result["reason"] = (
+            "有符合已核验硬条件的候选，但店级网页证据不足，暂不指定首选。" if eligible else
+            "暂无已确认符合全部硬条件的首选；缺少信息的候选列为待确认，明确不符的候选已排除。"
+        )
+    elif result.get("poi_candidates"):
+        top = next(p for p in eligible if p["name"] == result["top_pick"])
+        result["reason"] += " " + "；".join(top.get("recommendation_reasons", []))
+    return result
+
+
+def _decide_recommend_with_evidence(req, poi_result, search_runs, enriched_pois):
     bundles = _build_evidence_bundles(req, search_runs)
     anchors = expand_anchors(req["origin"])
 
@@ -1064,7 +1068,7 @@ def decide_recommend(req, poi_result, search_runs, enriched_pois):
             "top_area": req["origin"],
             "backups": backups,
             "reason": "先由结构化 POI 主源召回；候选名称在网页结果中命中，且类别相关证据达到当前阈值。",
-            "poi_candidates": enriched_pois[:RECOMMEND_DISPLAY_LIMIT],
+            "poi_candidates": [top] + [p for p in enriched_pois if p is not top][:RECOMMEND_DISPLAY_LIMIT - 1],
             "evidence": bundles[:2],
         }
 
@@ -1166,43 +1170,13 @@ def _accessibility_label(poi):
 
 
 def _constraint_assessments(req, poi):
-    tags = poi.get("tags") or {}
-    if not isinstance(tags, dict):
-        tags = {}
-    assessments = {}
-    for raw_constraint in req.get("constraints", []):
-        constraint = raw_constraint
-        for key, hints in CONSTRAINT_HINTS.items():
-            if raw_constraint == key or raw_constraint in hints:
-                constraint = key
-                break
-
-        state = "unknown"
-        if constraint == "seating":
-            seating = str(tags.get("seating") or "").strip().lower()
-            if seating in {"yes", "designated"}:
-                state = "met"
-            elif seating == "no":
-                state = "not_met"
-        elif constraint == "metro":
-            transit_parts = [
-                part
-                for step in (poi.get("transit_details") or {}).get("steps", [])
-                for part in step.get("parts", [])
-                if part.get("type") == "bus"
-            ]
-            if any(part.get("is_subway") for part in transit_parts):
-                state = "met"
-            elif transit_parts:
-                state = "not_met"
-        assessments[str(raw_constraint)] = state
-    return assessments
+    return assess_candidate(req, poi)["constraint_assessments"]
 
 
 def _render_poi_line(poi):
     parts = [
         poi["name"],
-        f"score={poi.get('total_score', poi.get('score'))}",
+        f"score={poi.get('ranking_score', poi.get('total_score', poi.get('score')))}",
         f"distance={poi.get('distance_m', '?')}m",
     ]
     accessibility = poi.get("accessibility") or {}
@@ -1219,6 +1193,10 @@ def _render_poi_line(poi):
         ))
     if poi.get("evidence_level"):
         parts.append(f"evidence={poi['evidence_level']}")
+    if poi.get("recommendation_reasons"):
+        parts.append("理由=" + "；".join(poi["recommendation_reasons"]))
+    if poi.get("data_source"):
+        parts.append(f"来源={poi['data_source']}，抓取={poi.get('observed_at') or '未知'}")
     return "- " + " | ".join(parts)
 
 
@@ -1233,6 +1211,13 @@ def render_markdown(req, result, poi_result):
     lines.append(f"- 偏好：{', '.join(req['preferences']) or '未指定'}")
     lines.append(f"- 约束：{', '.join(req['constraints']) or '未指定'}")
     lines.append(f"- 回避：{', '.join(req['avoid']) or '未指定'}")
+    if req.get("budget_max") is not None:
+        lines.append(f"- 人均预算上限：¥{req['budget_max']:g}（地图参考消费，非报价）")
+    if req.get("visit_at"):
+        lines.append(f"- 到访：{req['visit_at']}，停留 {req.get('stay_minutes', 0)} 分钟；时区 {req['timezone']}")
+    for warning in req.get("request_warnings", []):
+        lines.append(f"- 待澄清：{warning}")
+    lines.append(f"- 条件匹配状态：{result.get('planning_status', 'unknown')}")
     lines.append(f"- provider: {poi_result.get('provider', 'unknown')}")
     lines.append(f"- origin resolved: {((poi_result.get('origin') or {}).get('display_name')) or '未解析'}")
     if result.get("mode") == "search":
@@ -1257,7 +1242,7 @@ def render_markdown(req, result, poi_result):
         lines.append(f"- 置信度：{result['confidence']}")
         lines.append("")
         lines.append("## 首选")
-        lines.append(f"- 推荐：**{result['top_pick']}**")
+        lines.append(f"- 推荐：**{result['top_pick'] or '暂无已确认首选'}**")
         lines.append(f"- 理由：{result['reason']}")
         lines.append("")
         lines.append("## 结构化候选")
@@ -1282,6 +1267,10 @@ def render_markdown(req, result, poi_result):
             lines.append("- 如果要最终拍板，建议到场后二次筛店")
         else:
             lines.append("- 当前店级结果仍受网页索引质量与 POI 标注质量影响")
+    for key, title in (("pending_verification", "待确认候选"), ("excluded_candidates", "已排除候选")):
+        if result.get(key):
+            lines.extend(["", f"## {title}"])
+            lines.extend(_render_poi_line(poi) for poi in result[key])
     lines.append("")
     lines.append("## 网页证据摘要")
     for ev in result.get("evidence", []):
@@ -1301,6 +1290,12 @@ def main(argv=None):
     ap.add_argument("--mode", choices=["search", "recommend"])
     ap.add_argument("--preferences")
     ap.add_argument("--constraints")
+    ap.add_argument("--must", help="Hard requirements, comma-separated (e.g. seating,metro)")
+    ap.add_argument("--budget-max", type=float, help="Maximum map reference cost per person in CNY")
+    ap.add_argument("--visit-at", help="ISO arrival date/time; naive values use --timezone")
+    ap.add_argument("--stay-minutes", type=int, help="Required continuous stay, 0..1440 minutes")
+    ap.add_argument("--timezone", default="Asia/Shanghai", help="IANA timezone for arrival and provider hours")
+    ap.add_argument("--radius-m", type=int, help="Fixed search radius, 1..50000 metres")
     ap.add_argument("--avoid")
     ap.add_argument("--format", choices=["json", "markdown"], default="json")
     ap.add_argument("--poi-only", action="store_true", help="Skip web enrichment and specialty web fallback")
@@ -1313,6 +1308,16 @@ def main(argv=None):
     args = ap.parse_args(argv)
     if not math.isfinite(args.timeout) or args.timeout <= 0:
         ap.error("--timeout must be a finite positive number")
+    # Validate local requirements before any automatic location/network call.
+    try:
+        parse_requirements(args, args.query or "")
+        radius = args.radius_m if args.radius_m is not None else parse_radius_m(args.query or "", None)
+        if radius is None:
+            radius = parse_radius_m(args.constraints or "", 3000)
+        if not 1 <= radius <= 50000:
+            raise ValueError("--radius-m must be between 1 and 50000")
+    except (ValueError, KeyError, OverflowError) as exc:
+        ap.error(str(exc))
     t0 = time.time()
     deadline = time.monotonic() + args.timeout
     set_request_deadline(deadline)
@@ -1344,7 +1349,9 @@ def main(argv=None):
     if req["origin"] == "未指定起点" and resolved_origin:
         req["origin"] = resolved_origin.get("display_name") or f"{resolved_origin['lat']},{resolved_origin['lon']}"
         req["coordinate_system"] = resolved_origin.get("coordinate_system", req["coordinate_system"])
-    poi_candidates = poi_result.get("results", [])
+    poi_candidates = rank_candidates(req, poi_result.get("results", []))
+    excluded_pois = [p for p in poi_candidates if p["eligibility"] == "excluded"]
+    poi_candidates = [p for p in poi_candidates if p["eligibility"] != "excluded"]
     print(f"   ✅ POI 搜索：{len(poi_candidates)} 条候选（{time.time()-t0:.0f}s）", file=sys.stderr, flush=True)
     if poi_result.get("error") == "origin_required":
         enriched_pois = []
@@ -1373,24 +1380,12 @@ def main(argv=None):
         if fb:
             runs.insert(0, fb)
     print("⏳ 决策 + 交通详情...", file=sys.stderr, flush=True)
+    enriched_pois = _attach_transit_details(poi_result, enriched_pois, limit=transit_attach_limit)
+    decision_candidates = enriched_pois + excluded_pois
     if req["mode"] == "search":
-        result = decide_search(req, poi_result, runs, enriched_pois)
-        result["results"] = _attach_transit_details(
-            poi_result,
-            result.get("results", []),
-            limit=transit_attach_limit,
-        )
+        result = decide_search(req, poi_result, runs, decision_candidates)
     else:
-        result = decide_recommend(req, poi_result, runs, enriched_pois)
-        result["poi_candidates"] = _attach_transit_details(
-            poi_result,
-            result.get("poi_candidates", []),
-            limit=transit_attach_limit,
-        )
-
-    output_candidates = result.get("results", []) or result.get("poi_candidates", []) or []
-    for poi in output_candidates:
-        poi["constraint_assessments"] = _constraint_assessments(req, poi)
+        result = decide_recommend(req, poi_result, runs, decision_candidates)
 
     request_output = dict(req)
     if isinstance(request_output.get("ip_location"), dict):
