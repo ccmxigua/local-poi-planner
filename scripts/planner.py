@@ -12,7 +12,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from providers import normalize_category, search_pois, set_request_deadline
+from providers import normalize_category, search_pois, set_request_deadline, amap_coordinates
 
 try:
     from amap_ip_location import get_ip_location
@@ -407,6 +407,7 @@ def parse_request(args, deadline=None):
         "constraints": sorted(set(constraints)),
         "avoid": sorted(set(avoid)),
         "ip_location": ip_location,
+        "coordinate_system": getattr(args, "coordinate_system", "wgs84"),
     }
 
 
@@ -422,12 +423,16 @@ def expand_anchors(origin):
     return uniq
 
 
-def _reverse_geocode(lat, lon, deadline=None):
+def _reverse_geocode(lat, lon, deadline=None, coordinate_system="wgs84"):
     """Convert GPS coordinates to a human-readable location via Amap regeo API."""
     key = os.getenv("AMAP_KEY", "")
     if not key:
         return None
     try:
+        coords = amap_coordinates({"lat": lat, "lon": lon, "coordinate_system": coordinate_system})
+        if not coords:
+            return None
+        lat, lon = coords
         url = f"https://restapi.amap.com/v3/geocode/regeo?location={lon},{lat}&key={key}&radius=1000&extensions=base"
         req = urllib.request.Request(url)
         timeout = 5 if deadline is None else min(5, deadline - time.monotonic())
@@ -447,11 +452,11 @@ def _reverse_geocode(lat, lon, deadline=None):
     return None
 
 
-def _resolve_gps_anchor(anchor, deadline=None):
+def _resolve_gps_anchor(anchor, deadline=None, coordinate_system="wgs84"):
     """If anchor is bare GPS coords, resolve to human-readable name."""
     m = re.match(r"^\s*(-?\d+\.?\d*)\s*[,，]\s*(-?\d+\.?\d*)\s*$", anchor)
     if m:
-        resolved = _reverse_geocode(float(m.group(1)), float(m.group(2)), deadline=deadline)
+        resolved = _reverse_geocode(float(m.group(1)), float(m.group(2)), deadline=deadline, coordinate_system=coordinate_system)
         if resolved:
             return resolved
     return anchor
@@ -474,7 +479,7 @@ def build_queries(req, anchors, poi_candidates=None, mode="recommend", deadline=
         for poi in poi_candidates[:2]:
             queries.append(f"{poi['name']} {req['origin']} 评价 环境 人均")
     for a in anchors[:2]:
-        a_display = _resolve_gps_anchor(a, deadline=deadline)
+        a_display = _resolve_gps_anchor(a, deadline=deadline, coordinate_system=req.get("coordinate_system", "wgs84"))
         queries.append(f"{a_display} {keywords[0]} {core_cons} {core_pref}")
         if mode == "search":
             queries.append(f"{a_display} {' '.join(keywords[:3])} 哪些值得去")
@@ -486,12 +491,24 @@ def build_queries(req, anchors, poi_candidates=None, mode="recommend", deadline=
     return out[: (2 if mode == 'recommend' else 3)]
 
 
+def resolve_unified_search():
+    """Support both ClawHub and ordinary GitHub clone layouts."""
+    override = os.environ.get("LOCAL_POI_UNIFIED_SEARCH")
+    if override:
+        return Path(override).expanduser()
+    candidates = [UNIFIED_SEARCH, SKILL_DIR.parent / "unified-search-suite" / "scripts" / "unified-search.sh"]
+    return next((path for path in candidates if path.is_file()), candidates[0])
+
+
 def run_unified_search(query, deadline=None):
-    if not UNIFIED_SEARCH.exists():
-        return {"query": query, "ok": False, "output": "unified-search script not found"}
+    script = resolve_unified_search()
+    if not script.is_file():
+        message = "unified-search script not found; install the sibling dependency or set LOCAL_POI_UNIFIED_SEARCH"
+        return {"query": query, "ok": False, "count": None, "source_errors": [], "partial": False,
+                "stdout": "", "stderr": message, "output": message, "contract_error": "dependency_missing"}
     # The automatic route already selects deep search and returns JSON. Do not
     # append legacy flags: its parser would incorporate their values into the query.
-    cmd = ["bash", str(UNIFIED_SEARCH), query]
+    cmd = ["bash", str(script), query]
     timeout = 1800
     if deadline is not None:
         timeout = min(timeout, deadline - time.monotonic())
@@ -750,6 +767,7 @@ def _has_store_name_evidence(store_name, candidate_lines):
 
 
 def enrich_poi_with_web(req, pois, verify_limit=2, deadline=None):
+    verify_limit = max(0, min(verify_limit, len(pois)))
     poi_list = []
     for idx, poi in enumerate(pois):
         p = dict(poi)
@@ -759,7 +777,7 @@ def enrich_poi_with_web(req, pois, verify_limit=2, deadline=None):
     if verify_limit > 0:
         print(f"   ⏳ Web enrichment：并行搜 {min(verify_limit, len(poi_list))} 条 POI...", file=sys.stderr, flush=True)
     web_futures = {}
-    with ThreadPoolExecutor(max_workers=min(verify_limit, 5)) as executor:
+    with ThreadPoolExecutor(max_workers=max(1, min(verify_limit, 5))) as executor:
         for p in poi_list[:verify_limit]:
             q = f"{p['name']} {req['origin']} 评价 环境 人均"
             future = executor.submit(run_unified_search, q, deadline)
@@ -1082,10 +1100,12 @@ def _attach_transit_details(poi_result, pois, limit=2):
         return pois
 
     origin = poi_result.get("origin") or {}
-    origin_lng = origin.get("lon")
-    origin_lat = origin.get("lat")
-    if origin_lng is None or origin_lat is None:
+    if not any((poi.get("accessibility") or {}).get("mode") == "transit" for poi in pois):
         return pois
+    origin_coords = amap_coordinates(origin)
+    if not origin_coords:
+        return pois
+    origin_lat, origin_lng = origin_coords
 
     try:
         import amap_direction
@@ -1101,10 +1121,10 @@ def _attach_transit_details(poi_result, pois, limit=2):
         if accessibility.get("mode") != "transit":
             continue
 
-        dest_lng = poi.get("lon")
-        dest_lat = poi.get("lat")
-        if dest_lng is None or dest_lat is None:
+        dest_coords = amap_coordinates(poi)
+        if not dest_coords:
             continue
+        dest_lat, dest_lng = dest_coords
 
         try:
             details = amap_direction.get_transit_details(origin_lng, origin_lat, dest_lng, dest_lat)
@@ -1273,7 +1293,7 @@ def render_markdown(req, result, poi_result):
     return "\n".join(lines)
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--query", help="Natural language request")
     ap.add_argument("--origin")
@@ -1283,11 +1303,14 @@ def main():
     ap.add_argument("--constraints")
     ap.add_argument("--avoid")
     ap.add_argument("--format", choices=["json", "markdown"], default="json")
+    ap.add_argument("--poi-only", action="store_true", help="Skip web enrichment and specialty web fallback")
+    ap.add_argument("--coordinate-system", choices=["wgs84", "gcj02"], default="wgs84",
+                    help="Coordinate system for a numeric --origin (lat,lon); default: wgs84")
     ap.add_argument("--corelocation", action="store_true", help="Force CoreLocationCLI for current position")
     ap.add_argument("--timeout", type=float, default=1800, help="Overall request budget in seconds (default: 1800)")
     ap.add_argument("--location-policy", choices=["auto", "corelocation", "ip", "disabled"], default="auto",
                     help="Location lookup for nearby requests (default: auto; disabled requires --origin)")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
     if not math.isfinite(args.timeout) or args.timeout <= 0:
         ap.error("--timeout must be a finite positive number")
     t0 = time.time()
@@ -1301,6 +1324,7 @@ def main():
             loc = get_macos_location(timeout=min(10, max(0.01, deadline - time.monotonic())))
             if loc:
                 args.origin = f"{loc['lat']},{loc['lon']}"
+                args.coordinate_system = loc.get("coordinate_system", "wgs84")
                 print(f"📍 CoreLocation: {loc['lat']:.5f}, {loc['lon']:.5f}", file=sys.stderr, flush=True)
             else:
                 print("⚠️ CoreLocation returned no coordinates, falling back", file=sys.stderr, flush=True)
@@ -1316,6 +1340,10 @@ def main():
 
     print(f"⏳ POI 搜索（{req['origin']}，半径 {req.get('radius_m', 3000)}m）...", file=sys.stderr, flush=True)
     poi_result = search_pois(req, req["origin"], radius_m=req.get("radius_m", 3000), limit=provider_limit, ip_location=req.get("ip_location"))
+    resolved_origin = poi_result.get("origin") or {}
+    if req["origin"] == "未指定起点" and resolved_origin:
+        req["origin"] = resolved_origin.get("display_name") or f"{resolved_origin['lat']},{resolved_origin['lon']}"
+        req["coordinate_system"] = resolved_origin.get("coordinate_system", req["coordinate_system"])
     poi_candidates = poi_result.get("results", [])
     print(f"   ✅ POI 搜索：{len(poi_candidates)} 条候选（{time.time()-t0:.0f}s）", file=sys.stderr, flush=True)
     if poi_result.get("error") == "origin_required":
@@ -1323,6 +1351,10 @@ def main():
         queries = []
         runs = []
         print("⚠️ 缺少起点；跳过联网搜索，请提供 --origin 或启用位置解析", file=sys.stderr, flush=True)
+    elif args.poi_only:
+        enriched_pois = enrich_poi_with_web(req, poi_candidates, verify_limit=0, deadline=deadline)
+        queries = []
+        runs = []
     else:
         print(f"⏳ Web enrichment（最多 {verify_limit} 条 POI）...", file=sys.stderr, flush=True)
         enriched_pois = enrich_poi_with_web(req, poi_candidates, verify_limit=verify_limit, deadline=deadline)
@@ -1335,7 +1367,7 @@ def main():
     # Quality gate: trigger specialty fallback when evidence is weak
     pre_bundles = _build_evidence_bundles(req, runs)
     quality = _assess_bundle_quality(pre_bundles, req)
-    if quality["need_fallback"]:
+    if quality["need_fallback"] and not args.poi_only and poi_result.get("error") != "origin_required":
         print(f"   ⚠️ Evidence {quality['quality']} ({'; '.join(quality['reasons'])}), specialty fallback...", file=sys.stderr, flush=True)
         fb = _specialty_fallback_run(req)
         if fb:

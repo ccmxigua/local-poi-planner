@@ -16,12 +16,12 @@ the command fails.
 """
 
 import json
+import shutil
 import subprocess
 
-CLI_PATH = subprocess.run(
-    ["which", "CoreLocationCLI"],
-    capture_output=True, text=True, timeout=5
-).stdout.strip() or "/opt/homebrew/bin/CoreLocationCLI"
+from coordinates import valid_coordinates
+
+CLI_PATH = shutil.which("CoreLocationCLI") or "/opt/homebrew/bin/CoreLocationCLI"
 
 
 def get_macos_location(timeout=10):
@@ -59,32 +59,25 @@ def get_macos_location(timeout=10):
     # in some versions. Try to parse as JSON first, then as plain text.
     try:
         data = json.loads(output)
-        lat = float(data.get("latitude", data.get("lat", 0)))
-        lon = float(data.get("longitude", data.get("lon", data.get("lng", 0))))
-        if lat == 0 and lon == 0:
-            return None
-        return {
-            "lat": round(lat, 6),
-            "lon": round(lon, 6),
-            "accuracy": "wifi",
-            "provider": "corelocationcli",
-        }
     except json.JSONDecodeError:
         parts = output.split()
-        if len(parts) >= 2:
-            try:
-                lat = float(parts[0])
-                lon = float(parts[1])
-                return {
-                    "lat": round(lat, 6),
-                    "lon": round(lon, 6),
-                    "accuracy": "wifi",
-                    "provider": "corelocationcli",
-                }
-            except (ValueError, IndexError):
-                pass
-
-    return None
+        if len(parts) < 2:
+            return None
+        lat, lon = parts[:2]
+    else:
+        if not isinstance(data, dict):
+            return None
+        lat = data.get("latitude", data.get("lat"))
+        lon = data.get("longitude", data.get("lon", data.get("lng")))
+    if not valid_coordinates(lat, lon):
+        return None
+    return {
+        "lat": round(float(lat), 6),
+        "lon": round(float(lon), 6),
+        "accuracy": "wifi",
+        "provider": "corelocationcli",
+        "coordinate_system": "wgs84",
+    }
 
 
 if __name__ == "__main__":

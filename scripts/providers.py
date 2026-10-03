@@ -9,6 +9,8 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+from coordinates import valid_coordinates
+
 # Load .env.local if exists
 SCRIPT_DIR = Path(__file__).parent.resolve()
 ENV_FILE = SCRIPT_DIR.parent / ".env.local"
@@ -44,12 +46,14 @@ AMAP_INPUTTIPS_URL = "https://restapi.amap.com/v3/assistant/inputtips"
 UA = "local-poi-planner/0.2 (+OpenClaw skill)"
 
 _REQUEST_DEADLINE = None
+_AMAP_COORDINATE_CACHE = {}
 
 
 def set_request_deadline(deadline):
     """Set a monotonic request deadline shared by provider calls in this process."""
     global _REQUEST_DEADLINE
     _REQUEST_DEADLINE = deadline
+    _AMAP_COORDINATE_CACHE.clear()
     if AMAP_AVAILABLE:
         amap_direction.set_request_deadline(deadline)
     if AMAP_POI_AVAILABLE:
@@ -366,6 +370,7 @@ def _resolve_origin_via_amap_search(name):
         "lon": best["lon"],
         "display_name": best.get("display_name") or best.get("name") or name,
         "provider": best.get("provider", "amap_search"),
+        "coordinate_system": "gcj02",
         "resolved_name": best.get("name") or name,
         "type": best.get("type") or best.get("typecode") or "",
         "entr_location": best.get("entr_location"),
@@ -373,7 +378,7 @@ def _resolve_origin_via_amap_search(name):
     }
 
 
-def geocode_place(name):
+def geocode_place(name, coordinate_system=None):
     overrides = load_geocode_overrides()
     override_key = None
     if name in overrides:
@@ -388,23 +393,27 @@ def geocode_place(name):
             override_key = ranked_override_keys[0]
     if override_key:
         item = overrides[override_key]
-        return {
-            "name": name,
-            "lat": float(item["lat"]),
-            "lon": float(item["lon"]),
-            "display_name": item.get("display_name", override_key),
-            "provider": item.get("provider", "override"),
-        }
+        # Old overrides have no known datum. Re-geocode rather than guessing.
+        crs = item.get("coordinate_system")
+        if crs in {"wgs84", "gcj02"} and coordinate_system in {None, crs} and valid_coordinates(item.get("lat"), item.get("lon")):
+            return {
+                "name": name,
+                "lat": float(item["lat"]),
+                "lon": float(item["lon"]),
+                "display_name": item.get("display_name", override_key),
+                "provider": item.get("provider", "override"),
+                "coordinate_system": crs,
+            }
 
     is_chinese = bool(re.search(r"[\u4e00-\u9fff]", name))
 
-    if is_chinese and BIG_AOI_RE.search(name):
+    if coordinate_system != "wgs84" and is_chinese and BIG_AOI_RE.search(name):
         resolved = _resolve_origin_via_amap_search(name)
         if resolved:
             return resolved
 
     # Chinese address: try Amap geocoding first
-    if is_chinese:
+    if is_chinese and coordinate_system != "wgs84":
         try:
             from amap_geocode import geocode_address
             result = geocode_address(name, timeout=_bounded_timeout(10))
@@ -415,6 +424,7 @@ def geocode_place(name):
                     "lon": result["lon"],
                     "display_name": result.get("formatted_address", name),
                     "provider": "amap",
+                    "coordinate_system": "gcj02",
                 }
         except Exception:
             pass
@@ -448,6 +458,7 @@ def geocode_place(name):
             "lon": float(item["lon"]),
             "display_name": item.get("display_name", name),
             "provider": "osm",
+            "coordinate_system": "wgs84",
         }
     return None
 
@@ -541,8 +552,58 @@ def _parse_coordinates(value):
     return lat, lon
 
 
+def amap_coordinates(location):
+    """Return (lat, lon) in GCJ-02 using Amap's supported GPS conversion API.
 
-def search_overpass(req, origin_name, radius_m=2200, limit=8, enable_accessibility=True):
+    Never reinterpret unknown coordinates or attempt an unsupported inverse.
+    Successful conversions are cached only for the current planner request.
+    """
+    lat, lon = location.get("lat"), location.get("lon")
+    if not valid_coordinates(lat, lon):
+        return None
+    lat, lon = float(lat), float(lon)
+    crs = location.get("coordinate_system")
+    if crs == "gcj02":
+        return lat, lon
+    key = os.getenv("AMAP_KEY", "")
+    if crs != "wgs84" or not key:
+        return None
+    cache_key = (lat, lon)
+    if cache_key in _AMAP_COORDINATE_CACHE:
+        return _AMAP_COORDINATE_CACHE[cache_key]
+    try:
+        data = _http_get_json("https://restapi.amap.com/v3/assistant/coordinate/convert", params={
+            "key": key, "locations": f"{lon:.6f},{lat:.6f}", "coordsys": "gps", "output": "json",
+        }, timeout=10)
+        if data.get("status") != "1":
+            return None
+        converted_lon, converted_lat = data["locations"].split(",")
+        if not valid_coordinates(converted_lat, converted_lon):
+            return None
+        result = float(converted_lat), float(converted_lon)
+        _AMAP_COORDINATE_CACHE[cache_key] = result
+        return result
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return None
+
+
+def _enrich_osm_accessibility(results, origin):
+    """Keep OSM geometry intact; only routing requests receive Amap coordinates."""
+    origin_coords = amap_coordinates(origin)
+    if not origin_coords:
+        return results
+    for poi in results:
+        dest_coords = amap_coordinates(poi)
+        if not dest_coords:
+            continue
+        lat, lon = dest_coords
+        acc = amap_direction.get_accessibility(origin_coords[1], origin_coords[0], lon, lat)
+        poi["accessibility"] = acc
+        poi["total_score"] = round(poi.get("score", 50) * 0.7 + acc.get("score", 0) * 0.3, 1)
+    return results
+
+
+def search_overpass(req, origin_name, radius_m=2200, limit=8, enable_accessibility=True, coordinate_system=None):
     from planner import rank_poi
     patterns = category_to_patterns(req["category"])
     if not patterns:
@@ -557,6 +618,9 @@ def search_overpass(req, origin_name, radius_m=2200, limit=8, enable_accessibili
     if coordinates is False:
         return {"provider": "osm_overpass", "origin": None, "results": [], "error": "invalid_coordinates"}
     if coordinates:
+        crs = coordinate_system or req.get("coordinate_system", "wgs84")
+        if crs != "wgs84":
+            return {"provider": "osm_overpass", "origin": None, "results": [], "error": "wgs84_origin_required"}
         lat, lon = coordinates
         origin = {
             "name": origin_name,
@@ -564,9 +628,13 @@ def search_overpass(req, origin_name, radius_m=2200, limit=8, enable_accessibili
             "lon": lon,
             "display_name": origin_name,
             "provider": "coordinates",
+            "coordinate_system": "wgs84",
         }
     else:
-        origin = geocode_place(origin_name)
+        try:
+            origin = geocode_place(origin_name, coordinate_system="wgs84")
+        except Exception:
+            origin = None
     if not origin:
         return {"provider": "osm_overpass", "origin": None, "results": [], "error": "origin_geocode_failed"}
 
@@ -592,8 +660,8 @@ def search_overpass(req, origin_name, radius_m=2200, limit=8, enable_accessibili
             continue
         if _matches_avoid({"name": name, "tags": tags}, req.get("avoid", [])):
             continue
-        lat = el.get("lat") or (el.get("center") or {}).get("lat")
-        lon = el.get("lon") or (el.get("center") or {}).get("lon")
+        lat = el.get("lat", (el.get("center") or {}).get("lat"))
+        lon = el.get("lon", (el.get("center") or {}).get("lon"))
         if lat is None or lon is None:
             continue
         try:
@@ -613,20 +681,24 @@ def search_overpass(req, origin_name, radius_m=2200, limit=8, enable_accessibili
             "tags": tags,
             "distance_m": int(haversine_m(origin["lat"], origin["lon"], lat, lon)),
             "provider": "osm_overpass",
+            "coordinate_system": "wgs84",
         }
         poi["score"] = rank_poi(req, poi, origin, anchors)
         results.append(poi)
 
     if enable_accessibility and AMAP_AVAILABLE and results:
         try:
-            results = amap_direction.enrich_pois_with_accessibility(results, origin['lon'], origin['lat'])
+            results = _enrich_osm_accessibility(results, origin)
         except Exception:
             pass
 
-    if results and "total_score" in results[0]:
-        results.sort(key=lambda x: (-x.get("total_score", 0), x.get("accessibility", {}).get("duration_min", 999)))
-    else:
-        results.sort(key=lambda x: (-x["score"], x["distance_m"]))
+    # A conversion can fail for just one candidate. Unenriched candidates keep
+    # their base score; never choose the ranking method from the first item.
+    results.sort(key=lambda x: (
+        -x.get("total_score", x.get("score", 0)),
+        x.get("accessibility", {}).get("duration_min", 999),
+        x.get("distance_m", 99999),
+    ))
 
     return {"provider": "osm_overpass", "origin": origin, "results": results[:limit], "error": None}
 
@@ -668,6 +740,7 @@ def _format_amap_pois(pois, req, ref_lat, ref_lon, anchors, limit, enable_access
             "tel": poi.get("tel"),
             "distance_m": distance_m,
             "provider": "amap_poi",
+            "coordinate_system": "gcj02",
             "typecode": poi.get("typecode"),
             "tags": {
                 "name": poi.get("name"),
@@ -697,9 +770,16 @@ def _format_amap_pois(pois, req, ref_lat, ref_lon, anchors, limit, enable_access
 
 
 def search_amap_poi(req, origin_name, radius_m=3000, limit=8, enable_accessibility=True):
-    origin = geocode_place(origin_name)
+    try:
+        origin = geocode_place(origin_name)
+    except Exception:
+        origin = None
     if not origin:
         return {"provider": "amap_poi", "origin": None, "results": [], "error": "origin_geocode_failed"}
+    coords = amap_coordinates(origin)
+    if not coords:
+        return {"provider": "amap_poi", "origin": origin, "results": [], "error": "coordinate_conversion_failed"}
+    origin = dict(origin, lat=coords[0], lon=coords[1], coordinate_system="gcj02")
 
     if not AMAP_POI_AVAILABLE:
         return {"provider": "amap_poi", "origin": origin, "results": [], "error": "amap_poi_unavailable"}
@@ -725,11 +805,15 @@ def search_amap_poi(req, origin_name, radius_m=3000, limit=8, enable_accessibili
     return {"provider": "amap_poi", "origin": origin, "results": results, "error": None}
 
 
-def search_amap_poi_by_coords(req, lat, lon, radius_m=3000, limit=8, enable_accessibility=True):
+def search_amap_poi_by_coords(req, lat, lon, radius_m=3000, limit=8, enable_accessibility=True, coordinate_system="gcj02"):
     """Like search_amap_poi, but takes explicit coordinates (e.g. from IP geolocation)
     instead of a place name that needs geocoding."""
     if not AMAP_POI_AVAILABLE:
         return {"provider": "amap_poi", "origin": None, "results": [], "error": "amap_poi_unavailable"}
+    coords = amap_coordinates({"lat": lat, "lon": lon, "coordinate_system": coordinate_system})
+    if not coords:
+        return {"provider": "amap_poi", "origin": None, "results": [], "error": "coordinate_conversion_failed"}
+    lat, lon = coords
 
     display_name = f"{lat:.6f},{lon:.6f}"
     origin = {
@@ -737,7 +821,8 @@ def search_amap_poi_by_coords(req, lat, lon, radius_m=3000, limit=8, enable_acce
         "lat": lat,
         "lon": lon,
         "display_name": display_name,
-        "provider": "amap_ip",
+        "provider": "coordinates",
+        "coordinate_system": "gcj02",
     }
 
     category = normalize_category(req.get("category", "restaurant"))
@@ -878,6 +963,7 @@ def search_pois(req, origin_name, radius_m=3000, limit=8, enable_accessibility=T
         }
     # When origin is unresolved but IP coordinates are available, use them directly
     if ip_location and (not origin_name or origin_name == "未指定起点"):
+        crs = ip_location.get("coordinate_system") or ("gcj02" if ip_location.get("provider") == "amap_ip" else "wgs84")
         result = search_amap_poi_by_coords(
             req,
             lat=ip_location["lat"],
@@ -885,6 +971,7 @@ def search_pois(req, origin_name, radius_m=3000, limit=8, enable_accessibility=T
             radius_m=radius_m,
             limit=limit,
             enable_accessibility=enable_accessibility,
+            coordinate_system=crs,
         )
         if result.get("results"):
             return result
@@ -894,6 +981,7 @@ def search_pois(req, origin_name, radius_m=3000, limit=8, enable_accessibility=T
             radius_m,
             limit,
             enable_accessibility,
+            coordinate_system=crs,
         )
         fallback["fallback_from"] = {"provider": "amap_poi", "reason": result.get("error") or "empty"}
         return fallback
@@ -904,7 +992,8 @@ def search_pois(req, origin_name, radius_m=3000, limit=8, enable_accessibility=T
         return {"provider": "coordinates", "origin": None, "results": [], "error": "invalid_coordinates"}
     if coordinates:
         lat, lon = coordinates
-        result = search_amap_poi_by_coords(req, lat, lon, radius_m, limit, enable_accessibility)
+        result = search_amap_poi_by_coords(req, lat, lon, radius_m, limit, enable_accessibility,
+                                          coordinate_system=req.get("coordinate_system", "wgs84"))
         if result.get("results"):
             return result
         fallback = search_overpass(req, origin_name, radius_m, limit, enable_accessibility)

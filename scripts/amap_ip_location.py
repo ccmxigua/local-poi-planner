@@ -133,6 +133,7 @@ def _amap_ip_geolocate(ip, key=None, deadline=None):
         "accuracy": "city",
         "source_ip": ip,
         "provider": "amap_ip",
+        "coordinate_system": "gcj02",
     }
 
 

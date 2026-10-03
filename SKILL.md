@@ -12,7 +12,7 @@ files:
     - config/anchors.json: Optional anchor overrides for common places
     - config/geocode_overrides.json: Optional coordinate overrides for ambiguous place names
     - scripts/: Planner implementation
-    - unified-search/: Unified search skill (must be installed as sibling skill) → https://clawhub.ai/ccmxigua/unified-search-suite (default routes ordinary queries to the deep search-layer: Exa + Tavily + Grok + TinyFish; legacy three-engine path only via --legacy)
+    - unified-search/ or unified-search-suite/: Sibling web-search dependency → https://clawhub.ai/ccmxigua/unified-search-suite; alternatively set LOCAL_POI_UNIFIED_SEARCH to the full unified-search.sh path
   write:
     - /tmp/local-poi-planner-*.json: Intermediate planner outputs
     - /tmp/local-poi-planner-*.md: Final rendered reports
@@ -62,6 +62,7 @@ This skill is a **single top-level skill**. Internally it may call the existing 
 ### Location Resolution
 
 - `--origin` explicitly set: used directly
+- Numeric origins are `latitude,longitude`, defaulting to WGS84; pass `--coordinate-system gcj02` for Amap coordinates. Device/IP providers declare their own coordinate system.
 - `--corelocation` flag: forces CoreLocationCLI (WiFi-based, ~500m accuracy) to get current coordinates
 - `--location-policy auto` (default) + query contains nearby hints (`附近`/`周边`/`方圆`): tries CoreLocationCLI → IP geolocation fallback
 - `--location-policy corelocation` or `ip`: use only that automatic location source
@@ -73,6 +74,13 @@ Automatic IP location queries public IP lookup services and Amap. POI lookups se
 resolved coordinates or place name to the selected map provider; web enrichment sends
 search text to configured search providers. Use `--location-policy disabled` with an
 explicit `--origin` when you do not want automatic device/IP location lookup.
+
+Amap requests use GCJ-02. WGS84 input is converted via Amap's coordinate conversion
+API before POI lookup or routing. OSM fallback geocodes names separately in WGS84;
+GCJ-02 numeric input returns `wgs84_origin_required` if Amap fails, rather than
+querying OSM around an incorrect point. Supply a place name or WGS84 origin to use
+OSM in that case. `config/geocode_overrides.json` entries are used only when they
+declare a supported `coordinate_system`; untagged legacy entries are re-geocoded.
 
 ## Quick Start
 
@@ -103,6 +111,11 @@ python3 scripts/planner.py \
 ```
 
 ## Output contract
+
+`--poi-only` skips web enrichment and specialty web fallback and reports web status
+`not_run`. `scripts/quick_search.py` is a convenience entrypoint with this option
+and `--mode search` enabled by default; all ordinary planner flags remain available.
+It still calls map services and any location source allowed by `--location-policy`.
 
 The planner returns either:
 - **store-level recommendation** when evidence is sufficient, or
